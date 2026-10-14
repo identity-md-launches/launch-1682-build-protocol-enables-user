@@ -1,0 +1,10 @@
+{
+  "kind": "evm_contracts",
+  "contracts": [
+    {
+      "contract": "SwarmExit",
+      "constructorArgs": ["$owner"]
+    }
+  ],
+  "notes": "Deploys SwarmExit with the launch owner as its explicit Ownable2Step owner; the constructor makes no external calls and needs no other contract on chain. The accepted source fixes settlement to IMD at 0xD34a99Bc0f67aE1bbd63C660e6d0b0dd03E263B7 and sends a 2% sell tax of the gross IMD proceeds to treasury 0xFC3ad9C531e1736690b2d5f24FebD35ebf051cFB, the rest to the seller. sellAll takes up to 50 registered tokens with per-token minimum outputs and a deadline; each token is sold through its configured Uniswap V2, V3 or v4 route into IMD directly or via WETH/native ETH and the global IMD route. A token whose quote fails, is below the dust threshold or exceeds the price-impact bound is skipped before it is pulled; a token whose swap reverts is refunded in the same transaction, and a refund the token refuses is held for the user to claim with claimRefund. If nothing sells, the whole transaction reverts. preview and previewAll report sellability per token for the website. The token registry, token routes, IMD route and Chainlink ETH/USD feed start unset and require owner configuration before use; the owner can also change the dust threshold and impact bound, pause and unpause selling, rescue tokens that are neither registered nor held refunds, and transfer ownership in two steps. This manifest deploys only SwarmExit with no initialization calls or ETH funding. The existing website takes its confirmed deployment address from the launch handoff."
+}
