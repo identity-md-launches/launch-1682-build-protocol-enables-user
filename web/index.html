@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Swarm Exit: sell every swarm token for $IMD</title>
+  <style>
+    :root { color-scheme: light dark; --ok: #1b8a4a; --bad: #b3261e; --muted: #777; --bg: #fff; --fg: #111; --line: #ddd; }
+    @media (prefers-color-scheme: dark) { :root { --bg: #121212; --fg: #eee; --line: #333; --muted: #999; } }
+    body { font-family: system-ui, sans-serif; margin: 0; background: var(--bg); color: var(--fg); }
+    main { max-width: 960px; margin: 0 auto; padding: 24px; }
+    header { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
+    button { font: inherit; padding: 10px 16px; border-radius: 8px; border: 1px solid var(--line); background: var(--fg); color: var(--bg); cursor: pointer; }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    button.secondary { background: transparent; color: var(--fg); }
+    input { font: inherit; padding: 8px; border-radius: 6px; border: 1px solid var(--line); background: transparent; color: var(--fg); width: 100%; box-sizing: border-box; }
+    table { width: 100%; border-collapse: collapse; margin-top: 16px; }
+    th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+    th { font-weight: 600; color: var(--muted); font-size: .9em; }
+    td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+    tr.unsellable { background: rgba(179, 38, 30, .08); }
+    .tag { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: .8em; border: 1px solid; }
+    .tag.ok { color: var(--ok); border-color: var(--ok); }
+    .tag.bad { color: var(--bad); border-color: var(--bad); }
+    .totals { display: flex; gap: 24px; flex-wrap: wrap; margin: 20px 0; }
+    .tile { border: 1px solid var(--line); border-radius: 10px; padding: 14px 18px; min-width: 200px; }
+    .tile .label { color: var(--muted); font-size: .85em; }
+    .tile .value { font-size: 1.5em; font-weight: 600; }
+    #log { white-space: pre-wrap; font-family: ui-monospace, monospace; font-size: .85em; border: 1px solid var(--line); border-radius: 8px; padding: 12px; min-height: 60px; max-height: 240px; overflow: auto; }
+    .muted { color: var(--muted); }
+    .addr { font-family: ui-monospace, monospace; font-size: .85em; }
+    .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin: 12px 0; }
+    .row label { min-width: 160px; }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <h1 style="margin:0">Swarm Exit</h1>
+      <div class="muted">Sell every swarm-launched token in your wallet for $IMD in one click. 2% of the IMD goes to the treasury.</div>
+    </div>
+    <div>
+      <button id="connect">Connect wallet</button>
+      <span id="account" class="addr"></span>
+    </div>
+  </header>
+
+  <div class="row">
+    <label for="contract">SwarmExit contract</label>
+    <input id="contract" placeholder="0x… (filled from config.js after the launch)" />
+  </div>
+  <div class="row">
+    <label for="slippage">Slippage (bps)</label>
+    <input id="slippage" type="number" min="0" max="5000" style="max-width:120px" />
+    <button id="refresh" class="secondary" disabled>Refresh</button>
+  </div>
+
+  <div class="totals">
+    <div class="tile"><div class="label">Sellable tokens</div><div class="value" id="countSellable">–</div></div>
+    <div class="tile"><div class="label">Expected IMD (gross)</div><div class="value" id="totalImd">–</div></div>
+    <div class="tile"><div class="label">Total USD value</div><div class="value" id="totalUsd">–</div></div>
+    <div class="tile"><div class="label">You receive after 2% tax</div><div class="value" id="netImd">–</div></div>
+  </div>
+
+  <button id="sell" disabled>Sell all sellable tokens for $IMD</button>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Token</th>
+        <th class="num">Balance</th>
+        <th class="num">Expected IMD</th>
+        <th class="num">USD value</th>
+        <th>Status</th>
+      </tr>
+    </thead>
+    <tbody id="rows"><tr><td colspan="5" class="muted">Connect a wallet to load your swarm tokens.</td></tr></tbody>
+  </table>
+
+  <h3>Activity</h3>
+  <div id="log"></div>
+
+  <p class="muted" style="margin-top:24px">
+    Tokens marked as not sellable are never included in the transaction. A token whose sale fails on
+    chain (for example a honeypot that passes quotes) is refunded to your wallet inside the same
+    transaction. Consider sending the transaction through a private RPC such as Flashbots Protect to
+    avoid sandwiching.
+  </p>
+</main>
+<script src="./vendor/ethers.umd.min.js"></script>
+<script src="./config.js"></script>
+<script src="./app.js"></script>
+</body>
+</html>

@@ -1,0 +1,49 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.26;
+
+/// @notice Uniswap V2 style router (Uniswap V2 Router02, SushiSwap and forks).
+interface IUniswapV2Router {
+    function getAmountsOut(uint256 amountIn, address[] calldata path) external view returns (uint256[] memory amounts);
+
+    function swapExactTokensForTokensSupportingFeeOnTransferTokens(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external;
+}
+
+/// @notice Uniswap V3 SwapRouter02 style router (no deadline inside the params struct).
+interface IUniswapV3SwapRouter {
+    struct ExactInputParams {
+        bytes path;
+        address recipient;
+        uint256 amountIn;
+        uint256 amountOutMinimum;
+    }
+
+    function exactInput(ExactInputParams calldata params) external payable returns (uint256 amountOut);
+}
+
+/// @notice Uniswap V3 QuoterV2. Not a view: call it with eth_call.
+interface IUniswapV3Quoter {
+    function quoteExactInput(bytes memory path, uint256 amountIn)
+        external
+        returns (
+            uint256 amountOut,
+            uint160[] memory sqrtPriceX96AfterList,
+            uint32[] memory initializedTicksCrossedList,
+            uint256 gasEstimate
+        );
+}
+
+/// @notice Chainlink aggregator (ETH / USD).
+interface IAggregatorV3 {
+    function decimals() external view returns (uint8);
+
+    function latestRoundData()
+        external
+        view
+        returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound);
+}
