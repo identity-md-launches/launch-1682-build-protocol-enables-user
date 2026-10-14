@@ -436,22 +436,29 @@ contract SwarmExit is Ownable2Step, Pausable, ReentrancyGuard, IUnlockCallback {
     }
 
     /// @notice Uniswap v4 callback: runs the hops of the route encoded in `data`. In quote mode it
-    /// reverts with `V4Quote(amountOut)` so the manager's state rolls back; otherwise it settles the
-    /// input and takes the output.
+    /// runs the swaps on `amountIn` and reverts with `V4Quote(amountOut)` so the manager's state
+    /// rolls back. In sale mode it pays the input first (sync, transfer, settle) and swaps only what
+    /// the manager credited, so a token that charges a fee on transfer sells its measured amount
+    /// instead of leaving an unsettled delta; then it takes the output.
     function unlockCallback(bytes calldata data) external returns (bytes memory) {
         if (msg.sender == address(0) || msg.sender != _v4Manager) revert OnlyPoolManager();
         (bool quoteOnly, address currencyIn, V4Hop[] memory hops, uint256 amountIn) =
             abi.decode(data, (bool, address, V4Hop[], uint256));
-        (address currencyOut, uint256 amountOut) = _swapV4Hops(msg.sender, currencyIn, hops, amountIn);
-        if (quoteOnly) revert V4Quote(amountOut);
+        if (quoteOnly) {
+            (, uint256 quoted) = _swapV4Hops(msg.sender, currencyIn, hops, amountIn);
+            revert V4Quote(quoted);
+        }
         IUniswapV4PoolManager pm = IUniswapV4PoolManager(msg.sender);
+        uint256 paid;
         if (currencyIn == NATIVE) {
-            pm.settle{value: amountIn}();
+            paid = pm.settle{value: amountIn}();
         } else {
             pm.sync(currencyIn);
             IERC20(currencyIn).safeTransfer(msg.sender, amountIn);
-            pm.settle();
+            paid = pm.settle();
         }
+        if (paid < 1) revert NoProceeds();
+        (address currencyOut, uint256 amountOut) = _swapV4Hops(msg.sender, currencyIn, hops, paid);
         if (amountOut > 0) pm.take(currencyOut, address(this), amountOut);
         return "";
     }

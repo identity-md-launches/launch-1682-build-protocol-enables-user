@@ -280,6 +280,60 @@ contract SwarmExitRevisionTest is Test {
         assertEq(pm.locker(), address(0));
     }
 
+    /// A fee-on-transfer token on a v4 route sells its measured amount: the callback settles first
+    /// and swaps what the manager credited (amountIn minus the fee), so the user pays one fee, not two.
+    function test_feeOnTransferTokenSellsThroughV4WithMeasuredAmount() public {
+        FeeOnTransferToken fot = new FeeOnTransferToken(500);
+        _addV4(address(fot), IMD_ADDR, 50_000e18, 100_000e18);
+        vm.startPrank(OWNER);
+        _register(address(fot), SwarmExit.Venue.UniswapV4, address(pm), address(0), _v4(address(fot), IMD_ADDR));
+        vm.stopPrank();
+        fot.mint(user, 10_000e18);
+        vm.prank(user);
+        fot.approve(address(exit), type(uint256).max);
+
+        SwarmExit.Preview memory p = exit.preview(user, _one(address(fot)))[0];
+        assertTrue(p.sellable);
+        assertTrue(p.status == SwarmExit.Status.Sold);
+
+        // The pool receives 10_000 minus 5% twice (user -> contract, contract -> manager).
+        uint256 received = 10_000e18 * 9_500 / 10_000; // pulled into the contract
+        uint256 settled = received * 9_500 / 10_000; // credited by the manager
+        uint256 expected = pm.getAmountOut(_key(address(fot), IMD_ADDR), address(fot) < IMD_ADDR, settled);
+        assertLt(expected, p.expectedImd, "preview quotes the pre-fee balance");
+
+        vm.prank(user);
+        (SwarmExit.Outcome[] memory out, uint256 gross, uint256 tax, uint256 net) =
+            exit.sellAll(_two(address(fot), address(tokenV)), _zeros(2), block.timestamp);
+        assertTrue(out[0].status == SwarmExit.Status.Sold, "fee-on-transfer token sold through v4");
+        assertEq(out[0].amountIn, received);
+        assertEq(out[0].imdOut, expected);
+        assertTrue(out[1].status == SwarmExit.Status.Sold);
+        assertEq(gross, out[0].imdOut + out[1].imdOut);
+        assertEq(tax, gross * 200 / 10_000);
+        assertEq(net, gross - tax);
+        assertEq(imd.balanceOf(user), net);
+        assertEq(imd.balanceOf(TREASURY), tax);
+        assertEq(fot.balanceOf(user), 0, "whole balance pulled, nothing refunded");
+        assertEq(fot.balanceOf(address(exit)), 0, "nothing rests in the contract");
+        assertEq(imd.balanceOf(address(exit)), 0);
+        assertEq(pm.currencyDelta(address(fot)), 0);
+        assertEq(pm.locker(), address(0));
+    }
+
+    /// The native ETH leg still settles first and swaps exactly what was paid.
+    function test_v4NativeLegSettlesFirstAndSellsEverything() public {
+        uint256 expected = _expectedImd(address(tokenE));
+        vm.prank(user);
+        (SwarmExit.Outcome[] memory out,,, uint256 net) =
+            exit.sellAll(_one(address(tokenE)), _zeros(1), block.timestamp);
+        assertTrue(out[0].status == SwarmExit.Status.Sold);
+        assertEq(out[0].imdOut, expected);
+        assertEq(imd.balanceOf(user), net);
+        assertEq(address(exit).balance, 0);
+        assertEq(pm.currencyDelta(NATIVE), 0);
+    }
+
     function test_v2ToWethThenV4NativeImdRoute() public {
         // A -> WETH (V2), unwrap to ETH, ETH -> IMD (v4). Nothing rests in the contract afterwards.
         uint256 expected = _expectedImd(address(tokenA));
