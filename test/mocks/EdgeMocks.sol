@@ -134,6 +134,32 @@ contract FalseReturnToken is ERC20 {
     }
 }
 
+/// @notice Silently drops (burns) every transfer *to* `sink` while still returning `true`, and
+/// charges nothing elsewhere. On a Uniswap v4 route with the PoolManager as the sink the exit's
+/// `sync / transfer / settle` credits zero: the callback must refuse to swap and the sale must
+/// refund what was pulled instead of leaving the manager with an unsettled delta.
+contract SinkDropToken is ERC20 {
+    address public sink;
+
+    constructor() ERC20("SinkDrop", "DROP") {}
+
+    function mint(address to, uint256 amount) external {
+        _mint(to, amount);
+    }
+
+    function setSink(address s) external {
+        sink = s;
+    }
+
+    function _update(address from, address to, uint256 value) internal override {
+        if (to == sink && from != address(0)) {
+            super._update(from, address(0), value);
+            return;
+        }
+        super._update(from, to, value);
+    }
+}
+
 /// @notice Chainlink feed whose `latestRoundData` reverts (feed paused / deprecated).
 contract RevertingFeed {
     uint8 public constant decimals = 8;
