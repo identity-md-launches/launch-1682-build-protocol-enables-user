@@ -1,0 +1,10 @@
+{
+  "kind": "evm_contracts",
+  "contracts": [
+    {
+      "contract": "SwarmExit",
+      "constructorArgs": ["$owner"]
+    }
+  ],
+  "notes": "Deploys SwarmExit with the launch owner as its explicit Ownable2Step owner. The accepted source fixes settlement to IMD at 0xD34a99Bc0f67aE1bbd63C660e6d0b0dd03E263B7 and sends 2% of gross IMD proceeds to treasury 0xFC3ad9C531e1736690b2d5f24FebD35ebf051cFB. It supports batches of up to 50 registered tokens through configured Uniswap V2/V3 routes, per-token minimum outputs, and refunds when a swap reverts; if nothing sells, the entire transaction reverts. The token registry, swap routes and ETH/USD feed start unset and require owner configuration before use. The owner can also change the dust threshold, pause selling, rescue unregistered tokens and transfer ownership in two steps. This manifest deploys only SwarmExit and includes no initialization calls or ETH funding. The existing website requires its confirmed deployment address."
+}
