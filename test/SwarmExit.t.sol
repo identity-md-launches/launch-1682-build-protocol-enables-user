@@ -456,9 +456,12 @@ contract SwarmExitTest is Test {
         tokens[0] = address(noLiq);
         tokens[1] = address(tokenC);
         _approveAll(tokens);
+        vm.expectEmit(true, true, false, true);
+        emit SwarmExit.TokenSkipped(user, address(noLiq), SwarmExit.Status.QuoteFailed);
         vm.prank(user);
         (SwarmExit.Outcome[] memory out,,,) = exit.sellAll(tokens, _zeros(2), block.timestamp);
-        assertTrue(out[0].status == SwarmExit.Status.SaleFailed);
+        assertTrue(out[0].status == SwarmExit.Status.QuoteFailed, "skipped before the pull");
+        assertEq(out[0].amountIn, 0);
         assertEq(noLiq.balanceOf(user), 10_000e18);
         assertTrue(out[1].status == SwarmExit.Status.Sold);
     }
@@ -472,8 +475,26 @@ contract SwarmExitTest is Test {
         mins[0] = _expectedImd(address(tokenA)) + 1;
         vm.prank(user);
         (SwarmExit.Outcome[] memory out,,,) = exit.sellAll(tokens, mins, block.timestamp);
-        assertTrue(out[0].status == SwarmExit.Status.SaleFailed);
+        assertTrue(out[0].status == SwarmExit.Status.BelowMinimum, "a quote under the minimum is skipped, not pulled");
         assertEq(tokenA.balanceOf(user), 10_000e18);
+        assertEq(weth.balanceOf(address(exit)), 0);
+        assertTrue(out[1].status == SwarmExit.Status.Sold);
+    }
+
+    function test_slippageAtExecutionRefundsAndRollsBackFirstLeg() public {
+        // The fee-on-transfer token quotes its pre-fee balance, so a minimum just under the quote
+        // passes the pre-check and fails inside the atomic self-call: both legs roll back.
+        address[] memory tokens = new address[](2);
+        tokens[0] = address(feeTok);
+        tokens[1] = address(tokenC);
+        _approveAll(tokens);
+        uint256[] memory mins = new uint256[](2);
+        mins[0] = _expectedImd(address(feeTok)) - 1;
+        vm.prank(user);
+        (SwarmExit.Outcome[] memory out,,,) = exit.sellAll(tokens, mins, block.timestamp);
+        assertTrue(out[0].status == SwarmExit.Status.SaleFailed);
+        assertEq(feeTok.balanceOf(user), 9_025e18, "pulled and refunded, one fee each way");
+        assertEq(feeTok.balanceOf(address(exit)), 0);
         assertEq(weth.balanceOf(address(exit)), 0, "first leg was rolled back with the second");
         assertTrue(out[1].status == SwarmExit.Status.Sold);
     }
@@ -498,7 +519,7 @@ contract SwarmExitTest is Test {
         tokenC.approve(address(fresh), type(uint256).max);
         (SwarmExit.Outcome[] memory out,,,) = fresh.sellAll(tokens, _zeros(2), block.timestamp);
         vm.stopPrank();
-        assertTrue(out[0].status == SwarmExit.Status.SaleFailed);
+        assertTrue(out[0].status == SwarmExit.Status.BridgeRouteMissing, "skipped before the pull");
         assertEq(tokenA.balanceOf(user), 10_000e18);
         assertTrue(out[1].status == SwarmExit.Status.Sold, "direct-to-IMD route needs no bridge");
     }
@@ -552,10 +573,29 @@ contract SwarmExitTest is Test {
         assertEq(tokenA.balanceOf(user), 10_000e18);
     }
 
-    function test_missingApprovalRevertsWholeCall() public {
+    function test_missingApprovalIsSkippedAndAloneRevertsNothingSold() public {
         vm.prank(user);
-        vm.expectRevert();
+        vm.expectRevert(SwarmExit.NothingSold.selector);
         exit.sellAll(_one(address(tokenA)), _zeros(1), block.timestamp);
+        address[] memory tokens = new address[](2);
+        tokens[0] = address(tokenA);
+        tokens[1] = address(tokenC);
+        _approveAll(_one(address(tokenC)));
+        vm.prank(user);
+        (SwarmExit.Outcome[] memory out,,,) = exit.sellAll(tokens, _zeros(2), block.timestamp);
+        assertTrue(out[0].status == SwarmExit.Status.NoAllowance);
+        assertEq(tokenA.balanceOf(user), 10_000e18);
+        assertTrue(out[1].status == SwarmExit.Status.Sold);
+    }
+
+    function test_pullIsCappedByAllowanceNotBalance() public {
+        vm.prank(user);
+        tokenA.approve(address(exit), 4_000e18);
+        vm.prank(user);
+        (SwarmExit.Outcome[] memory out,,,) = exit.sellAll(_one(address(tokenA)), _zeros(1), block.timestamp);
+        assertTrue(out[0].status == SwarmExit.Status.Sold);
+        assertEq(out[0].amountIn, 4_000e18);
+        assertEq(tokenA.balanceOf(user), 6_000e18);
     }
 
     function test_pauseBlocksSelling() public {

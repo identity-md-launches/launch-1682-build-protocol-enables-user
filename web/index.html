@@ -52,7 +52,7 @@
   </div>
   <div class="row">
     <label for="slippage">Slippage (bps)</label>
-    <input id="slippage" type="number" min="0" max="5000" style="max-width:120px" />
+    <input id="slippage" type="number" min="0" max="5000" step="1" style="max-width:120px" />
     <button id="refresh" class="secondary" disabled>Refresh</button>
   </div>
 
@@ -84,8 +84,9 @@
   <p class="muted" style="margin-top:24px">
     Tokens marked as not sellable are never included in the transaction. A token whose sale fails on
     chain (for example a honeypot that passes quotes) is refunded to your wallet inside the same
-    transaction. Consider sending the transaction through a private RPC such as Flashbots Protect to
-    avoid sandwiching.
+    transaction; if the token refuses even the refund, the contract holds it for you and a claim
+    button appears here. Consider sending the transaction through a private RPC such as Flashbots
+    Protect to avoid sandwiching.
   </p>
 </main>
 <script src="./vendor/ethers.umd.min.js"></script>

@@ -10,9 +10,14 @@
     "function ethUsdPrice() view returns (uint256 price,uint8 decimals)",
     "function paused() view returns (bool)",
     "function minImdOut() view returns (uint256)",
+    "function MAX_TOKENS_PER_SALE() view returns (uint256)",
+    "function heldRefunds(address user,address token) view returns (uint256)",
+    "function claimRefund(address token)",
     "function sellAll(address[] tokens,uint256[] minImdOuts,uint256 deadline) returns (tuple(address token,uint256 amountIn,uint256 imdOut,uint8 status)[] outcomes,uint256 grossImd,uint256 tax,uint256 netImd)",
     "event TokenSold(address indexed user,address indexed token,uint256 amountIn,uint256 imdOut)",
+    "event TokenSkipped(address indexed user,address indexed token,uint8 status)",
     "event TokenRefunded(address indexed user,address indexed token,uint256 amount,bytes reason)",
+    "event RefundHeld(address indexed user,address indexed token,uint256 amount)",
     "event SoldAll(address indexed user,uint256 grossImd,uint256 tax,uint256 netImd)",
   ];
   const ERC20_ABI = [
@@ -30,7 +35,11 @@
     "No liquidity (quote failed)",
     "Below minimum proceeds",
     "Sale would fail on chain",
+    "Price impact too high (not enough liquidity)",
+    "Not approved",
   ];
+  const STATUS_SOLD = 0;
+  const STATUS_SALE_FAILED = 7;
   const TAX_BPS = 200n;
 
   const $ = (id) => document.getElementById(id);
@@ -46,8 +55,16 @@
     return n.toLocaleString(undefined, { maximumFractionDigits: places });
   };
   const usd = (n) => (n == null ? "–" : n.toLocaleString(undefined, { style: "currency", currency: "USD" }));
+  const key = (a) => a.toLowerCase();
+  // Contract-returned strings (symbol) are never interpolated into HTML; cells are built with textContent.
+  const cell = (cls, text) => {
+    const td = document.createElement("td");
+    if (cls) td.className = cls;
+    if (text != null) td.textContent = text;
+    return td;
+  };
 
-  let provider, signer, account, exit, rows = [], imdUsd = null;
+  let provider, signer, account, exit, rows = [], imdUsd = null, maxPerSale = 50;
 
   $("contract").value = cfg.swarmExit || "";
   $("slippage").value = String(cfg.slippageBps);
@@ -101,17 +118,21 @@
     rows = [];
     render();
     if (await exit.paused()) log("SwarmExit is paused by its owner; selling is disabled.");
+    try { maxPerSale = Number(await exit.MAX_TOKENS_PER_SALE()); } catch (_) { maxPerSale = 50; }
     await loadImdUsd();
     const previews = await exit.previewAll.staticCall(account);
-    const held = previews.filter((p) => p.balance > 0n);
+    const tokens = previews.map((p) => p.token);
+    const heldAmounts = await Promise.all(tokens.map((t) => exit.heldRefunds(account, t).catch(() => 0n)));
+    const held = previews.filter((p, i) => p.balance > 0n || heldAmounts[i] > 0n);
     log(`${previews.length} swarm tokens registered, ${held.length} held by this wallet.`);
     for (const p of held) {
       const erc = new ethers.Contract(p.token, ERC20_ABI, provider);
       let symbol = short(p.token), decimals = 18;
       try { [symbol, decimals] = await Promise.all([erc.symbol(), erc.decimals()]); } catch (_) { /* non-standard metadata */ }
       rows.push({
-        token: p.token, symbol, decimals: Number(decimals), balance: p.balance,
+        token: p.token, symbol: String(symbol).slice(0, 32), decimals: Number(decimals), balance: p.balance,
         expectedImd: p.expectedImd, sellable: p.sellable, status: Number(p.status), note: "",
+        heldRefund: heldAmounts[tokens.indexOf(p.token)],
       });
     }
     render();
@@ -130,12 +151,39 @@
       if (r.sellable) { totalImd += r.expectedImd; count += 1; if (value != null) totalUsd += value; }
       const tr = document.createElement("tr");
       tr.className = r.sellable ? "" : "unsellable";
-      tr.innerHTML = `
-        <td><strong>${r.symbol}</strong><br/><span class="addr muted">${r.token}</span></td>
-        <td class="num">${fmt(r.balance, r.decimals)}</td>
-        <td class="num">${r.sellable ? fmt(r.expectedImd) : "–"}</td>
-        <td class="num">${r.sellable ? usd(value) : "–"}</td>
-        <td><span class="tag ${r.sellable ? "ok" : "bad"}">${STATUS[r.status] || "Unknown"}</span>${r.note ? `<br/><span class="muted">${r.note}</span>` : ""}</td>`;
+
+      const tokenCell = cell();
+      const strong = document.createElement("strong");
+      strong.textContent = r.symbol;
+      const addr = document.createElement("span");
+      addr.className = "addr muted";
+      addr.textContent = r.token;
+      tokenCell.append(strong, document.createElement("br"), addr);
+      tr.appendChild(tokenCell);
+
+      tr.appendChild(cell("num", fmt(r.balance, r.decimals)));
+      tr.appendChild(cell("num", r.sellable ? fmt(r.expectedImd) : "–"));
+      tr.appendChild(cell("num", r.sellable ? usd(value) : "–"));
+
+      const statusCell = cell();
+      const tag = document.createElement("span");
+      tag.className = `tag ${r.sellable ? "ok" : "bad"}`;
+      tag.textContent = STATUS[r.status] || "Unknown";
+      statusCell.appendChild(tag);
+      if (r.note) {
+        const note = document.createElement("span");
+        note.className = "muted";
+        note.textContent = r.note;
+        statusCell.append(document.createElement("br"), note);
+      }
+      if (r.heldRefund > 0n) {
+        const btn = document.createElement("button");
+        btn.className = "secondary";
+        btn.textContent = `Claim held refund (${fmt(r.heldRefund, r.decimals)} ${r.symbol})`;
+        btn.addEventListener("click", () => claimRefund(r).catch((e) => log(`Error: ${e.shortMessage || e.message}`)));
+        statusCell.append(document.createElement("br"), btn);
+      }
+      tr.appendChild(statusCell);
       body.appendChild(tr);
     }
     $("countSellable").textContent = String(count);
@@ -145,8 +193,17 @@
   }
 
   function slippageBps() {
-    const v = BigInt(Math.max(0, Math.min(5000, Number($("slippage").value) || 0)));
-    return v;
+    const n = Number($("slippage").value);
+    if (!Number.isFinite(n)) throw new Error("Slippage must be a whole number of basis points.");
+    return BigInt(Math.round(Math.max(0, Math.min(5000, n))));
+  }
+
+  async function claimRefund(r) {
+    log(`Claiming held refund of ${r.symbol}…`);
+    const tx = await exit.claimRefund(r.token);
+    await tx.wait();
+    log(`Refund claimed: ${tx.hash}`);
+    await refresh();
   }
 
   async function ensureApprovals(selected) {
@@ -154,60 +211,99 @@
       const erc = new ethers.Contract(r.token, ERC20_ABI, signer);
       const allowance = await erc.allowance(account, exit.target);
       if (allowance >= r.balance) continue;
-      log(`Approving ${fmt(r.balance, r.decimals)} ${r.symbol} (exact balance)…`);
+      log(`Approving ${fmt(r.balance, r.decimals)} ${r.symbol} (exact balance; the contract never pulls more than the allowance)…`);
       const tx = await erc.approve(exit.target, r.balance);
       await tx.wait();
       log(`Approved ${r.symbol}: ${tx.hash}`);
     }
   }
 
+  const deadline = () => BigInt(Math.floor(Date.now() / 1000) + cfg.deadlineSeconds);
+
+  function markFailed(r, note) {
+    r.sellable = false; r.status = STATUS_SALE_FAILED; r.note = note;
+  }
+
+  // Dry run with zero minimums. Sales execute one after another and share the IMD pool, so the
+  // simulated outputs are the real quote. A token whose sale would fail, or would yield nothing, is
+  // highlighted and left out. If the whole call reverts, each token is simulated alone to find the
+  // culprit(s), and the batch is simulated again without them.
+  async function simulate(batch) {
+    const minImdOut = await exit.minImdOut().catch(() => 0n);
+    let selected = batch.slice();
+    for (let attempt = 0; attempt < 2 && selected.length > 0; attempt += 1) {
+      let sim;
+      try {
+        sim = await exit.sellAll.staticCall(selected.map((r) => r.token), selected.map(() => 0n), deadline());
+      } catch (e) {
+        log(`Batch simulation reverted (${e.shortMessage || e.reason || e.message}); checking tokens one by one…`);
+        const keep = [];
+        for (const r of selected) {
+          try {
+            const one = await exit.sellAll.staticCall([r.token], [0n], deadline());
+            const o = one.outcomes[0];
+            if (Number(o.status) === STATUS_SOLD && o.imdOut >= minImdOut && o.imdOut > 0n) keep.push(r);
+            else markFailed(r, "Simulation shows this sale would not settle; excluded.");
+          } catch (err) {
+            markFailed(r, `Simulation reverted: ${err.shortMessage || err.reason || err.message}`);
+          }
+        }
+        selected = keep;
+        continue;
+      }
+      const simulated = new Map(sim.outcomes.map((o) => [key(o.token), o]));
+      const survivors = [];
+      for (const r of selected) {
+        const o = simulated.get(key(r.token));
+        if (o && Number(o.status) === STATUS_SOLD && o.imdOut >= minImdOut && o.imdOut > 0n) {
+          r.expectedImd = o.imdOut;
+          r.note = "Expected IMD updated from the simulated sale.";
+          survivors.push(r);
+        } else {
+          markFailed(r, "Simulation shows this sale would fail or yield nothing; excluded.");
+        }
+      }
+      return survivors;
+    }
+    return selected;
+  }
+
   async function sellAll() {
     $("sell").disabled = true;
     try {
+      const bps = slippageBps(); // validated before any transaction is sent
       let selected = rows.filter((r) => r.sellable);
       if (selected.length === 0) throw new Error("Nothing sellable.");
-      await ensureApprovals(selected);
+      const batches = [];
+      for (let i = 0; i < selected.length; i += maxPerSale) batches.push(selected.slice(i, i + maxPerSale));
+      if (batches.length > 1) log(`${selected.length} tokens: selling in ${batches.length} transactions of at most ${maxPerSale}.`);
 
-      const bps = slippageBps();
-      const deadline = () => BigInt(Math.floor(Date.now() / 1000) + cfg.deadlineSeconds);
+      for (const batch of batches) {
+        log("Simulating the sale…");
+        const chosen = await simulate(batch);
+        render();
+        const excluded = batch.length - chosen.length;
+        if (excluded > 0) log(`${excluded} token(s) would fail on chain and were excluded.`);
+        if (chosen.length === 0) { log("No token in this batch can be sold right now."); continue; }
 
-      // Dry run with zero minimums. Sales execute one after another and share the WETH/IMD pool, so
-      // the simulated outputs are the real quote; isolated per-token quotes overstate later tokens.
-      // A token whose sale would fail on chain is highlighted and left out of the real transaction.
-      log("Simulating the sale…");
-      const sim = await exit.sellAll.staticCall(selected.map((r) => r.token), selected.map(() => 0n), deadline());
-      const simulated = new Map(sim.outcomes.map((o) => [o.token.toLowerCase(), o]));
-      const failed = new Set();
-      for (const r of rows) {
-        const o = simulated.get(r.token.toLowerCase());
-        if (!o) continue;
-        if (Number(o.status) === 0) {
-          r.expectedImd = o.imdOut;
-          r.note = "Expected IMD updated from the simulated sale.";
-        } else {
-          failed.add(r.token.toLowerCase());
-          r.sellable = false; r.status = 7; r.note = "Simulation reverted inside the swap; excluded from the sale.";
+        await ensureApprovals(chosen);
+        log(`Selling ${chosen.length} token(s) for IMD (minimums ${bps} bps under the simulated outputs)…`);
+        const tx = await exit.sellAll(
+          chosen.map((r) => r.token),
+          chosen.map((r) => (r.expectedImd * (10000n - bps)) / 10000n),
+          deadline(),
+        );
+        log(`Sent ${tx.hash}`);
+        const receipt = await tx.wait();
+        for (const l of receipt.logs) {
+          let parsed; try { parsed = exit.interface.parseLog(l); } catch (_) { continue; }
+          if (!parsed) continue;
+          if (parsed.name === "TokenSold") log(`Sold ${short(parsed.args.token)} for ${fmt(parsed.args.imdOut)} IMD`);
+          if (parsed.name === "TokenSkipped") log(`Skipped ${short(parsed.args.token)}: ${STATUS[Number(parsed.args.status)] || "not sellable"}`);
+          if (parsed.name === "TokenRefunded") log(`Refunded ${short(parsed.args.token)}: sale failed on chain, tokens returned`);
+          if (parsed.name === "RefundHeld") log(`Refund of ${short(parsed.args.token)} is held by the contract (the token refused the transfer); claim it from the table.`);
+          if (parsed.name === "SoldAll") log(`Done. Gross ${fmt(parsed.args.grossImd)} IMD, tax ${fmt(parsed.args.tax)} IMD, received ${fmt(parsed.args.netImd)} IMD`);
         }
-      }
-      render();
-      selected = selected.filter((r) => !failed.has(r.token.toLowerCase()));
-      if (failed.size > 0) log(`${failed.size} token(s) would fail on chain and were excluded.`);
-      if (selected.length === 0) throw new Error("No token can be sold right now.");
-
-      log(`Selling ${selected.length} token(s) for IMD (minimums ${bps} bps under the simulated outputs)…`);
-      const tx = await exit.sellAll(
-        selected.map((r) => r.token),
-        selected.map((r) => (r.expectedImd * (10000n - bps)) / 10000n),
-        deadline(),
-      );
-      log(`Sent ${tx.hash}`);
-      const receipt = await tx.wait();
-      for (const l of receipt.logs) {
-        let parsed; try { parsed = exit.interface.parseLog(l); } catch (_) { continue; }
-        if (!parsed) continue;
-        if (parsed.name === "TokenSold") log(`Sold ${short(parsed.args.token)} for ${fmt(parsed.args.imdOut)} IMD`);
-        if (parsed.name === "TokenRefunded") log(`Refunded ${short(parsed.args.token)}: sale failed on chain, tokens returned`);
-        if (parsed.name === "SoldAll") log(`Done. Gross ${fmt(parsed.args.grossImd)} IMD, tax ${fmt(parsed.args.tax)} IMD, received ${fmt(parsed.args.netImd)} IMD`);
       }
       await refresh();
     } catch (e) {
