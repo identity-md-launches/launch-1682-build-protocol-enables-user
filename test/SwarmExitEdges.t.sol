@@ -13,6 +13,7 @@ import {
     OverReportingToken,
     AllBurnToken,
     GasBurnToken,
+    FalseReturnToken,
     RevertingFeed
 } from "./mocks/EdgeMocks.sol";
 
@@ -260,7 +261,7 @@ contract SwarmExitEdgesTest is SwarmExitFixture {
         assertEq(weth.balanceOf(address(exit)), 0);
     }
 
-    function test_routeEndingInAnotherSwarmTokenIsRefunded() public {
+    function test_routeEndingInAnotherSwarmTokenIsSkippedBeforeThePull() public {
         // D -> A; A is a swarm token but not the bridge token, so the second leg cannot run.
         MockERC20 d = new MockERC20("D", "D");
         _addLiquidity(address(d), address(tokenA), 1_000e18, 1_000e18);
@@ -274,12 +275,16 @@ contract SwarmExitEdgesTest is SwarmExitFixture {
         SwarmExit.Preview[] memory p = exit.preview(user, _one(address(d)));
         assertTrue(p[0].status == SwarmExit.Status.BridgeRouteMissing);
         _approveAll(user, _two(address(d), address(tokenC)));
+        vm.expectEmit(true, true, false, true);
+        emit SwarmExit.TokenSkipped(user, address(d), SwarmExit.Status.BridgeRouteMissing);
         vm.prank(user);
         (SwarmExit.Outcome[] memory out,,,) =
             exit.sellAll(_two(address(d), address(tokenC)), _zeros(2), block.timestamp);
-        assertTrue(out[0].status == SwarmExit.Status.SaleFailed);
-        assertEq(d.balanceOf(user), 100e18, "refunded in full");
-        assertEq(tokenA.balanceOf(address(exit)), 0, "first leg rolled back");
+        assertTrue(out[0].status == SwarmExit.Status.BridgeRouteMissing, "predictable failure: never pulled");
+        assertEq(out[0].amountIn, 0);
+        assertEq(d.balanceOf(user), 100e18, "nothing left the wallet");
+        assertEq(tokenA.balanceOf(address(exit)), 0, "first leg never ran");
+        assertEq(d.balanceOf(address(exit)), 0);
         assertTrue(out[1].status == SwarmExit.Status.Sold);
     }
 
@@ -321,9 +326,14 @@ contract SwarmExitEdgesTest is SwarmExitFixture {
 
     // ------------------------------------------------------------------ amounts at the edges
 
-    function test_oneWeiBalanceSellsWithZeroTax() public {
+    /// @dev With the default floor (1e15 IMD) one wei is skipped and the call reverts `NothingSold`
+    /// (covered in SwarmExitRevision). With the floor disabled by the owner it must still settle
+    /// without losing the wei to rounding: tax rounds down to zero, the user gets everything.
+    function test_oneWeiBalanceSellsWithZeroTaxWhenFloorDisabled() public {
         address tiny = makeAddr("tiny");
         tokenC.mint(tiny, 1);
+        vm.prank(OWNER);
+        exit.setMinImdOut(0);
         _approveAll(tiny, _one(address(tokenC)));
         vm.prank(tiny);
         (SwarmExit.Outcome[] memory out, uint256 gross, uint256 tax, uint256 net) =
@@ -342,6 +352,9 @@ contract SwarmExitEdgesTest is SwarmExitFixture {
         amount = uint96(bound(amount, 1, 10_000e18));
         address who = makeAddr("fuzzTax");
         tokenC.mint(who, amount);
+        // disable the dust floor so the arithmetic is exercised down to one wei of proceeds
+        vm.prank(OWNER);
+        exit.setMinImdOut(0);
         _approveAll(who, _one(address(tokenC)));
         uint256 expected = _expectedImd(who, address(tokenC));
         vm.prank(who);
@@ -435,7 +448,8 @@ contract SwarmExitEdgesTest is SwarmExitFixture {
             exit.sellAll(_two(address(tokenA), address(tokenB)), _zeros(2), block.timestamp);
         assertTrue(out[1].status == SwarmExit.Status.Sold);
         assertLt(out[1].imdOut, isolatedB, "sequential sales share liquidity");
-        // and a user who passed the isolated quote as the minimum is refunded, not short-changed
+        // and a user who passed the isolated quote as the minimum is skipped (the quote is re-run
+        // after A's sale moved the shared pool), never pulled and never short-changed
         tokenA.mint(user, 10_000e18);
         tokenB.mint(user, 5_000e18);
         uint256[] memory mins = new uint256[](2);
@@ -443,26 +457,45 @@ contract SwarmExitEdgesTest is SwarmExitFixture {
         vm.prank(user);
         (out,,,) = exit.sellAll(_two(address(tokenA), address(tokenB)), mins, block.timestamp);
         assertTrue(out[0].status == SwarmExit.Status.Sold);
-        assertTrue(out[1].status == SwarmExit.Status.SaleFailed);
+        assertTrue(out[1].status == SwarmExit.Status.BelowMinimum, "re-quoted after A, below the stale minimum");
+        assertEq(out[1].amountIn, 0);
+        assertEq(out[1].imdOut, 0);
         assertEq(tokenB.balanceOf(user), 5_000e18);
+        assertEq(tokenB.balanceOf(address(exit)), 0);
     }
 
     // ------------------------------------------------------------------ misbehaving tokens
 
-    function test_partialApprovalRevertsWholeCallNothingMoves() public {
+    function test_partialApprovalOneWeiShortSellsExactlyTheAllowance() public {
         vm.startPrank(user);
         tokenA.approve(address(exit), 10_000e18 - 1);
         tokenC.approve(address(exit), type(uint256).max);
-        vm.expectRevert();
-        exit.sellAll(_two(address(tokenC), address(tokenA)), _zeros(2), block.timestamp);
+        (SwarmExit.Outcome[] memory out, uint256 gross, uint256 tax, uint256 net) =
+            exit.sellAll(_two(address(tokenC), address(tokenA)), _zeros(2), block.timestamp);
         vm.stopPrank();
-        assertEq(tokenA.balanceOf(user), 10_000e18);
-        assertEq(tokenC.balanceOf(user), 1_000e18);
-        assertEq(imd.balanceOf(user), 0);
-        assertEq(imd.balanceOf(TREASURY), 0);
+        assertTrue(out[0].status == SwarmExit.Status.Sold);
+        assertTrue(out[1].status == SwarmExit.Status.Sold, "the pull is capped by the allowance, not reverted");
+        assertEq(out[1].amountIn, 10_000e18 - 1);
+        assertEq(tokenA.balanceOf(user), 1, "the unapproved wei stays in the wallet");
+        assertEq(tokenA.allowance(user, address(exit)), 0, "the whole allowance was consumed");
+        assertEq(tokenC.balanceOf(user), 0);
+        assertEq(gross, out[0].imdOut + out[1].imdOut);
+        assertEq(imd.balanceOf(user), net);
+        assertEq(imd.balanceOf(TREASURY), tax);
     }
 
-    function test_overReportingBalanceRevertsWholeCallNothingMoves() public {
+    function test_allowanceAboveBalanceSellsTheBalanceOnly() public {
+        vm.prank(user);
+        tokenA.approve(address(exit), 10_000e18 + 1);
+        vm.prank(user);
+        (SwarmExit.Outcome[] memory out,,,) = exit.sellAll(_one(address(tokenA)), _zeros(1), block.timestamp);
+        assertTrue(out[0].status == SwarmExit.Status.Sold);
+        assertEq(out[0].amountIn, 10_000e18);
+        assertEq(tokenA.balanceOf(user), 0);
+        assertEq(tokenA.allowance(user, address(exit)), 1, "only the balance was pulled");
+    }
+
+    function test_overReportingBalanceIsASaleFailureNotABatchRevert() public {
         OverReportingToken liar = new OverReportingToken();
         liar.mint(user, 100e18);
         liar.setExtra(1);
@@ -473,17 +506,26 @@ contract SwarmExitEdgesTest is SwarmExitFixture {
             address(liar), SwarmExit.Venue.UniswapV2, address(v2), address(0), _v2(address(liar), IMD_ADDR)
         );
         vm.stopPrank();
+        assertTrue(exit.preview(user, _one(address(liar)))[0].sellable, "the lie passes the quote");
         _approveAll(user, _two(address(liar), address(tokenC)));
         vm.prank(user);
-        vm.expectRevert();
-        exit.sellAll(_two(address(tokenC), address(liar)), _zeros(2), block.timestamp);
-        assertEq(tokenC.balanceOf(user), 1_000e18);
-        assertEq(imd.balanceOf(user), 0);
+        (SwarmExit.Outcome[] memory out,,,) =
+            exit.sellAll(_two(address(tokenC), address(liar)), _zeros(2), block.timestamp);
+        assertTrue(out[0].status == SwarmExit.Status.Sold);
+        assertTrue(out[1].status == SwarmExit.Status.SaleFailed, "the pull of balance+1 fails, the batch goes on");
+        assertEq(out[1].amountIn, 0);
+        assertEq(out[1].imdOut, 0);
+        assertEq(liar.balanceOf(user), 100e18 + 1, "nothing real left the wallet");
+        assertEq(liar.balanceOf(address(exit)), 1, "the exit holds only the phantom wei");
+        assertEq(tokenC.balanceOf(user), 0);
+        assertGt(imd.balanceOf(user), 0);
     }
 
     function test_tokenBurningEverythingOnTransferIsReportedZeroBalance() public {
         AllBurnToken burn = new AllBurnToken();
         burn.mint(user, 100e18);
+        // the pool records the amounts it was told, so the quote succeeds and the pull is attempted
+        _addLiquidity(address(burn), IMD_ADDR, 1_000e18, 1_000e18);
         vm.startPrank(OWNER);
         exit.setSwarmToken(address(burn), true);
         exit.setTokenRoute(
@@ -496,7 +538,9 @@ contract SwarmExitEdgesTest is SwarmExitFixture {
             exit.sellAll(_two(address(burn), address(tokenC)), _zeros(2), block.timestamp);
         assertTrue(out[0].status == SwarmExit.Status.ZeroBalance, "nothing arrived, nothing to sell");
         assertEq(out[0].amountIn, 0);
+        assertEq(out[0].imdOut, 0);
         assertEq(burn.balanceOf(address(exit)), 0);
+        assertEq(burn.balanceOf(user), 0, "the token itself burned the pull; the exit never had it");
         assertTrue(out[1].status == SwarmExit.Status.Sold);
     }
 
@@ -584,7 +628,8 @@ contract SwarmExitEdgesTest is SwarmExitFixture {
     }
 
     function testFuzz_honeypotRefundIsExactForAnyAmount(uint128 amount) public {
-        amount = uint128(bound(amount, 1, type(uint128).max));
+        // lower bound clears the 1e15 IMD dust floor (1 HONEY ~ 1 IMD) so the pull is attempted
+        amount = uint128(bound(amount, 1e16, type(uint128).max));
         address who = makeAddr("honeyHolder");
         honey.mint(who, amount);
         tokenC.mint(who, 1e18);
@@ -600,16 +645,154 @@ contract SwarmExitEdgesTest is SwarmExitFixture {
     }
 
     function test_feeOnTransferRefundReturnsEverythingTheExitHolds() public {
-        pools.setBroken(address(feeTok), address(weth), true);
+        // A broken pool is now caught by the pre-pull quote (nothing pulled, no fee paid). The
+        // execution-time failure that still costs a fee is a minimum the pre-fee quote clears but
+        // the post-fee sale cannot: the refund must then be every wei the exit received.
         _approveAll(user, _two(address(feeTok), address(tokenC)));
+        uint256[] memory mins = new uint256[](2);
+        mins[0] = _expectedImd(user, address(feeTok));
         vm.prank(user);
         (SwarmExit.Outcome[] memory out,,,) =
-            exit.sellAll(_two(address(feeTok), address(tokenC)), _zeros(2), block.timestamp);
+            exit.sellAll(_two(address(feeTok), address(tokenC)), mins, block.timestamp);
         assertTrue(out[0].status == SwarmExit.Status.SaleFailed);
-        assertEq(out[0].amountIn, 9_500e18);
+        assertEq(out[0].amountIn, 9_500e18, "amountIn is what arrived, not what was asked");
         assertEq(feeTok.balanceOf(address(exit)), 0, "exit keeps nothing");
+        assertEq(weth.balanceOf(address(exit)), 0, "first leg rolled back");
         // the token itself burned 5% on each leg; the exit returned all 9_500 it held
         assertEq(feeTok.balanceOf(user), 9_025e18);
+        assertTrue(out[1].status == SwarmExit.Status.Sold);
+    }
+
+    // ------------------------------------------------------------------ false-returning tokens and held refunds
+
+    function _registerFalseReturn() internal returns (FalseReturnToken fls) {
+        fls = new FalseReturnToken();
+        fls.mint(user, 100e18);
+        _addLiquidity(address(fls), IMD_ADDR, 1_000e18, 1_000e18);
+        vm.startPrank(OWNER);
+        exit.setSwarmToken(address(fls), true);
+        exit.setTokenRoute(
+            address(fls), SwarmExit.Venue.UniswapV2, address(v2), address(0), _v2(address(fls), IMD_ADDR)
+        );
+        vm.stopPrank();
+        _approveAll(user, _two(address(fls), address(tokenC)));
+    }
+
+    function test_pullReturningFalseIsASaleFailureNotASettledSale() public {
+        FalseReturnToken fls = _registerFalseReturn();
+        fls.setBlocked(address(exit), true); // transferFrom into the exit returns false, moves nothing
+        vm.expectEmit(true, true, false, true);
+        emit SwarmExit.TokenRefunded(user, address(fls), 0, bytes("transfer returned false"));
+        vm.prank(user);
+        (SwarmExit.Outcome[] memory out,,,) =
+            exit.sellAll(_two(address(fls), address(tokenC)), _zeros(2), block.timestamp);
+        assertTrue(out[0].status == SwarmExit.Status.SaleFailed, "a false return is a failed pull");
+        assertEq(out[0].amountIn, 0);
+        assertEq(out[0].imdOut, 0);
+        assertEq(fls.balanceOf(user), 100e18);
+        assertEq(fls.balanceOf(address(exit)), 0);
+        assertTrue(out[1].status == SwarmExit.Status.Sold);
+    }
+
+    function test_refundReturningFalseIsHeldNotLost() public {
+        FalseReturnToken fls = _registerFalseReturn();
+        fls.setBlocked(address(pools), true); // the swap's transfer into the pool returns false: sale fails
+        fls.setBlocked(user, true); // and the refund transfer returns false too
+        vm.prank(user);
+        (SwarmExit.Outcome[] memory out,,,) =
+            exit.sellAll(_two(address(fls), address(tokenC)), _zeros(2), block.timestamp);
+        assertTrue(out[0].status == SwarmExit.Status.SaleFailed);
+        assertEq(out[0].amountIn, 100e18);
+        assertEq(fls.balanceOf(user), 0);
+        assertEq(fls.balanceOf(address(exit)), 100e18, "the exit still holds it");
+        assertEq(exit.heldRefunds(user, address(fls)), 100e18, "and owes it to the user");
+        assertEq(exit.totalHeld(address(fls)), 100e18);
+        assertTrue(out[1].status == SwarmExit.Status.Sold);
+
+        // a false-returning claim reverts (SafeERC20), the entry survives, a later claim succeeds
+        vm.prank(user);
+        vm.expectRevert();
+        exit.claimRefund(address(fls));
+        assertEq(exit.heldRefunds(user, address(fls)), 100e18);
+        fls.setBlocked(user, false);
+        vm.prank(user);
+        exit.claimRefund(address(fls));
+        assertEq(fls.balanceOf(user), 100e18);
+        assertEq(exit.totalHeld(address(fls)), 0);
+    }
+
+    function test_heldRefundsAccumulateAcrossTwoSalesAndClaimOnce() public {
+        FalseReturnToken fls = _registerFalseReturn();
+        fls.setBlocked(address(pools), true);
+        fls.setBlocked(user, true);
+        vm.prank(user);
+        exit.sellAll(_two(address(fls), address(tokenC)), _zeros(2), block.timestamp);
+        fls.mint(user, 50e18);
+        tokenC.mint(user, 1e18);
+        vm.prank(user);
+        exit.sellAll(_two(address(fls), address(tokenC)), _zeros(2), block.timestamp);
+        assertEq(exit.heldRefunds(user, address(fls)), 150e18, "second sale adds, does not overwrite");
+        assertEq(exit.totalHeld(address(fls)), 150e18);
+        assertEq(fls.balanceOf(address(exit)), 150e18);
+        fls.setBlocked(user, false);
+        vm.prank(user);
+        exit.claimRefund(address(fls));
+        assertEq(fls.balanceOf(user), 150e18);
+        assertEq(fls.balanceOf(address(exit)), 0);
+        assertEq(exit.heldRefunds(user, address(fls)), 0);
+    }
+
+    function test_heldRefundIsPerUserAndStrangersCannotClaimIt() public {
+        FalseReturnToken fls = _registerFalseReturn();
+        fls.setBlocked(address(pools), true);
+        fls.setBlocked(user, true);
+        vm.prank(user);
+        exit.sellAll(_two(address(fls), address(tokenC)), _zeros(2), block.timestamp);
+        address stranger = makeAddr("stranger");
+        assertEq(exit.heldRefunds(stranger, address(fls)), 0);
+        vm.prank(stranger);
+        vm.expectRevert(SwarmExit.NothingToClaim.selector);
+        exit.claimRefund(address(fls));
+        vm.prank(OWNER);
+        vm.expectRevert(SwarmExit.NothingToClaim.selector);
+        exit.claimRefund(address(fls));
+        // and the same user has nothing to claim for a token that was never held
+        vm.prank(user);
+        vm.expectRevert(SwarmExit.NothingToClaim.selector);
+        exit.claimRefund(address(tokenC));
+        assertEq(fls.balanceOf(address(exit)), 100e18, "nothing left while the owner is blocked");
+    }
+
+    function test_heldRefundPlusStrayBalanceRescueIsBoundedToTheStray() public {
+        FalseReturnToken fls = _registerFalseReturn();
+        fls.setBlocked(address(pools), true);
+        fls.setBlocked(user, true);
+        vm.prank(user);
+        exit.sellAll(_two(address(fls), address(tokenC)), _zeros(2), block.timestamp);
+        fls.mint(address(exit), 7e18); // stray on top of the 100e18 held
+        vm.startPrank(OWNER);
+        exit.setSwarmToken(address(fls), false); // only then is rescue even considered
+        vm.expectRevert(SwarmExit.CannotRescueHeldRefunds.selector);
+        exit.rescue(address(fls), OWNER, 7e18 + 1);
+        exit.rescue(address(fls), OWNER, 7e18);
+        vm.stopPrank();
+        assertEq(fls.balanceOf(OWNER), 7e18);
+        assertEq(fls.balanceOf(address(exit)), 100e18, "held refund untouched");
+        fls.setBlocked(user, false);
+        vm.prank(user);
+        exit.claimRefund(address(fls));
+        assertEq(fls.balanceOf(user), 100e18, "claimable even after the token was unregistered");
+    }
+
+    function test_rescueEthToARecipientThatRejectsItReverts() public {
+        vm.deal(address(exit), 1 ether);
+        vm.prank(OWNER);
+        vm.expectRevert(SwarmExit.EthTransferFailed.selector);
+        exit.rescue(address(0), address(pools), 1 ether); // MockPools has no receive function
+        vm.prank(OWNER);
+        vm.expectRevert(SwarmExit.CannotRescueHeldRefunds.selector);
+        exit.rescue(address(0), OWNER, 1 ether + 1);
+        assertEq(address(exit).balance, 1 ether);
     }
 
     // ------------------------------------------------------------------ stray balances in the exit

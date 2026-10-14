@@ -107,6 +107,33 @@ contract GasBurnToken is ERC20 {
     }
 }
 
+/// @notice Returns `false` (without reverting or moving anything) from `transfer` / `transferFrom`
+/// when the recipient is blocked. Exercises SwarmExit's "transfer returned false" rule, which must
+/// be treated exactly like a revert: a failed pull or a held refund, never a settled sale.
+contract FalseReturnToken is ERC20 {
+    mapping(address => bool) public blockedRecipient;
+
+    constructor() ERC20("FalseReturn", "FLS") {}
+
+    function mint(address to, uint256 amount) external {
+        _mint(to, amount);
+    }
+
+    function setBlocked(address who, bool blocked) external {
+        blockedRecipient[who] = blocked;
+    }
+
+    function transfer(address to, uint256 value) public override returns (bool) {
+        if (blockedRecipient[to]) return false;
+        return super.transfer(to, value);
+    }
+
+    function transferFrom(address from, address to, uint256 value) public override returns (bool) {
+        if (blockedRecipient[to]) return false;
+        return super.transferFrom(from, to, value);
+    }
+}
+
 /// @notice Chainlink feed whose `latestRoundData` reverts (feed paused / deprecated).
 contract RevertingFeed {
     uint8 public constant decimals = 8;
