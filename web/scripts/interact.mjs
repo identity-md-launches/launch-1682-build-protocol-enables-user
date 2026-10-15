@@ -16,18 +16,28 @@ const viem = await import(pathToFileURL(path.join(ROOT, "web/node_modules/viem/_
 const { chromium } = await import(process.env.IMD_PLAYWRIGHT ? pathToFileURL(process.env.IMD_PLAYWRIGHT).href : "playwright");
 const { swarmExitAbi } = await import(pathToFileURL(path.join(ROOT, "web/src/abi/swarmExit.ts")).href);
 const { erc20Abi } = await import(pathToFileURL(path.join(ROOT, "web/src/abi/erc20.ts")).href);
+const { factoryAbi } = await import(pathToFileURL(path.join(ROOT, "web/src/abi/factory.ts")).href);
+const { v4QuoterAbi, stateViewAbi } = await import(pathToFileURL(path.join(ROOT, "web/src/abi/v4.ts")).href);
 const { decodeFunctionData, encodeFunctionResult, encodeEventTopics, encodeAbiParameters, parseUnits, getAddress, keccak256, toHex } = viem;
 
 const EXIT = "0x5c3c2a6d7d340db9f8b3e0cbbc8dbbb7ec73bc61";
 const IMD = "0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7";
 const WETH = "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2";
 const USER = "0x1000000000000000000000000000000000000001";
+const OWNER = "0x0ace1dbe8aab293cd58d5e3ea38814f0ccb74782";
+const FACTORY = "0xff03410d0fe5fa8f7f59f743de35e333d9857120";
+const STATE_VIEW = "0x7ffe42c4a5deea5b0fec41c94c136cf115597227";
+const QUOTER = "0x52f0e24d1c21c8a0cb1e5a5dd6198556bd9e1203";
+const HOOK = "0x784ff9a3ac5d88a30bfff6f7f2a270161fbe6000";
+const ZERO = "0x0000000000000000000000000000000000000000";
+let ownerIsUser = false;
 const T = {
   alpha: "0x1111111111111111111111111111111111111111", // sellable, v4 to IMD
   beta: "0x2222222222222222222222222222222222222222", // sellable, V2 to WETH; fails on chain and is refunded
   gamma: "0x3333333333333333333333333333333333333333", // no route configured
   delta: "0x4444444444444444444444444444444444444444", // route but quote fails
   empty: "0x5555555555555555555555555555555555555555", // zero balance, not listed
+  epsilon: "0x6666666666666666666666666666666666666666", // launched, held, not registered: quoted through its pool
 };
 const meta = {
   [T.alpha]: { symbol: "ALPHA", decimals: 18, balance: parseUnits("12500", 18), expected: parseUnits("100", 18), sellable: true, status: 0, route: [3, "0x000000000004444c5dc75cb358380d2e3de08a90", "0x0000000000000000000000000000000000000000", T.alpha, IMD] },
@@ -35,7 +45,11 @@ const meta = {
   [T.gamma]: { symbol: "GAMMA", decimals: 18, balance: parseUnits("900000", 18), expected: 0n, sellable: false, status: 3, route: [0, "0x0000000000000000000000000000000000000000", "0x0000000000000000000000000000000000000000", "0x0000000000000000000000000000000000000000", "0x0000000000000000000000000000000000000000"] },
   [T.delta]: { symbol: "DELTA", decimals: 6, balance: 4200000000n, expected: 0n, sellable: false, status: 5, route: [2, "0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45", "0x61ffe014ba17989e743c5f6cb21bf9697530b21e", T.delta, WETH] },
   [T.empty]: { symbol: "EMPTY", decimals: 18, balance: 0n, expected: 0n, sellable: false, status: 2, route: [0, "0x0000000000000000000000000000000000000000", "0x0000000000000000000000000000000000000000", "0x0000000000000000000000000000000000000000", "0x0000000000000000000000000000000000000000"] },
+  [T.epsilon]: { symbol: "EPSILON", decimals: 18, balance: parseUnits("77000", 18), expected: 0n, sellable: false, status: 1, unregistered: true, poolQuote: parseUnits("20", 18), route: [0, "0x0000000000000000000000000000000000000000", "0x0000000000000000000000000000000000000000", "0x0000000000000000000000000000000000000000", "0x0000000000000000000000000000000000000000"] },
 };
+const registered = Object.values(T).filter((t) => !meta[t].unregistered);
+// Launch ids 1403.. map to the mock tokens, as the factory's positionOf would report them.
+const launchIds = Object.fromEntries(Object.values(T).map((t, i) => [1403 + i, t]));
 const tokens = Object.values(T);
 const calls = [];
 let txCount = 0;
@@ -52,7 +66,11 @@ function ethCall({ to, data }) {
       case "paused": return enc(false);
       case "MAX_TOKENS_PER_SALE": return enc(50n);
       case "minImdOut": return enc(parseUnits("0.001", 18));
-      case "previewAll": return enc(tokens.map((t) => ({ token: getAddress(t), balance: meta[t].balance, expectedImd: meta[t].expected, sellable: meta[t].sellable, status: meta[t].status })));
+      case "preview": return enc(args[1].map((a) => { const t = a.toLowerCase(); const m = meta[t]; return m.unregistered ? { token: getAddress(t), balance: 0n, expectedImd: 0n, sellable: false, status: 1 } : { token: getAddress(t), balance: m.balance, expectedImd: m.expected, sellable: m.sellable, status: m.status }; }));
+      case "swarmTokens": return enc(registered.map((t) => getAddress(t)));
+      case "owner": return enc(getAddress(ownerIsUser ? USER : OWNER));
+      case "imdRoute": return enc({ venue: 3, router: getAddress("0x000000000004444c5dc75cb358380d2e3de08a90"), quoter: ZERO, tokenIn: ZERO, tokenOut: getAddress(IMD), data: "0x" });
+      case "ethUsdFeed": return enc(getAddress("0x5f4ec3df9cbd43714fe2740f5e3616155c5b8419"));
       case "heldRefunds": return enc(0n);
       case "tokenRoute": { const r = meta[args[0].toLowerCase()].route; return enc({ venue: r[0], router: getAddress(r[1]), quoter: getAddress(r[2]), tokenIn: getAddress(r[3]), tokenOut: getAddress(r[4]), data: "0x" }); }
       case "quoteImdInBridge": return enc(parseUnits("0.0001", 18)); // 1 IMD = 0.0001 ETH
@@ -67,12 +85,36 @@ function ethCall({ to, data }) {
       default: throw new Error(`unmocked SwarmExit call ${functionName}`);
     }
   }
+  if (target === FACTORY) {
+    const { functionName, args } = decodeFunctionData({ abi: factoryAbi, data });
+    const enc = (result) => encodeFunctionResult({ abi: factoryAbi, functionName, result });
+    if (functionName === "deploymentBlock") return enc(args[0] === 1682n ? 26188854n : 0n);
+    if (functionName === "positionOf") {
+      const t = launchIds[Number(args[0])];
+      if (!t) return enc([ZERO, ZERO, 0, 0, ZERO, 0, 0, ZERO]);
+      return enc([getAddress(t), getAddress(IMD), 12500, 60, getAddress(HOOK), -128940, 887220, getAddress(OWNER)]);
+    }
+  }
+  if (target === STATE_VIEW) {
+    const { functionName } = decodeFunctionData({ abi: stateViewAbi, data });
+    const enc = (result) => encodeFunctionResult({ abi: stateViewAbi, functionName, result });
+    if (functionName === "getLiquidity") return enc(parseUnits("1", 22));
+  }
+  if (target === QUOTER) {
+    const { functionName, args } = decodeFunctionData({ abi: v4QuoterAbi, data });
+    calls.push("quoter");
+    const tokenIn = (args[0].zeroForOne ? args[0].poolKey.currency0 : args[0].poolKey.currency1).toLowerCase();
+    const m = meta[tokenIn];
+    if (!m || !m.poolQuote) throw new Error("NotEnoughLiquidity");
+    return encodeFunctionResult({ abi: v4QuoterAbi, functionName, result: [m.poolQuote, 100000n] });
+  }
   if (meta[target]) {
     const { functionName } = decodeFunctionData({ abi: erc20Abi, data });
     calls.push(`erc20.${functionName}`);
     const enc = (result) => encodeFunctionResult({ abi: erc20Abi, functionName, result });
     if (functionName === "symbol") return enc(meta[target].symbol);
     if (functionName === "decimals") return enc(meta[target].decimals);
+    if (functionName === "balanceOf") return enc(meta[target].balance);
     if (functionName === "allowance") return enc(0n);
   }
   throw new Error(`unmocked eth_call to ${to}`);
@@ -235,18 +277,23 @@ for (const width of [390, 1440]) {
   await page.screenshot({ path: path.join(OUT, `${width}-connected.png`), fullPage: true });
   check(await page.getByRole("button", { name: /0x1000…0001/ }).isVisible(), `${width}: header shows the short address and Disconnect`);
   const rows = page.locator("table.tokens tbody tr");
-  check((await rows.count()) === 4, `${width}: four held tokens listed, zero balance token hidden (${await rows.count()})`);
+  check((await rows.count()) === 5, `${width}: five held tokens listed (four registered, one only launched), zero balance token hidden (${await rows.count()})`);
+  check(calls.includes("quoter"), `${width}: the unregistered token was quoted through its launch pool`);
+  check(await page.getByText("20 IMD if registered").isVisible(), `${width}: EPSILON shows its pool quote as 'if registered'`);
+  check(await page.getByText("Not registered in SwarmExit yet, though its pool would buy it").isVisible(), `${width}: EPSILON explains it is not registered`);
+  check(await page.getByText("1 of your tokens are not registered in SwarmExit yet; the contract owner has to register them before they can be sold here.").isVisible(), `${width}: status line tells the holder about unregistered tokens`);
+  check((await page.locator("#owner-heading").count()) === 0, `${width}: owner setup hidden for a non-owner`);
   check(await page.getByText("Uniswap v4 to IMD").isVisible(), `${width}: ALPHA sell route identified`);
   check(await page.getByText("Uniswap V2 to ETH, then IMD").isVisible(), `${width}: BETA sell route identified`);
-  check((await page.getByText("No sell route found").count()) === 2, `${width}: GAMMA and DELTA marked 'No sell route found'`);
+  check((await page.getByText("No sell route found").count()) === 3, `${width}: GAMMA, DELTA and EPSILON marked 'No sell route found'`);
   const dim = await page.locator("tr.dim").count();
-  check(dim === 2, `${width}: two rows greyed out (${dim})`);
+  check(dim === 3, `${width}: three rows greyed out (${dim})`);
   const gammaColor = await page.locator("tr.dim td[data-label=Token] .token-name").first().evaluate((el) => getComputedStyle(el).color);
   const alphaColor = await page.locator("tr:not(.dim) td[data-label=Token] .token-name").first().evaluate((el) => getComputedStyle(el).color);
   check(gammaColor !== alphaColor, `${width}: greyed rows use the disabled text color (${gammaColor} vs ${alphaColor})`);
   check(await page.getByText("$30.00").isVisible(), `${width}: ALPHA USD value shown (100 IMD at $0.30)`);
   check(await page.getByText("$15.00").isVisible(), `${width}: BETA USD value shown`);
-  check(await page.getByText("$45.00").isVisible(), `${width}: total USD value shown`);
+  check(await page.getByText("$51.00").isVisible(), `${width}: total USD value shown (100 + 50 sellable + 20 quoted IMD at $0.30)`);
   check(await page.getByText("147 IMD").isVisible(), `${width}: net after 2% fee shown (147 IMD)`);
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
   check(overflow <= 0, `${width}: no horizontal overflow when the list is full (${overflow})`);
@@ -302,6 +349,29 @@ for (const width of [390, 1440]) {
   check(overflow <= 0, `320: no horizontal overflow with the list (${overflow})`);
   await page.screenshot({ path: path.join(OUT, "320-connected.png"), fullPage: true });
   await ctx.close();
+}
+
+// ---- 5. the owner wallet sees the setup panel ----
+{
+  ownerIsUser = true;
+  const { ctx, page, errors } = await openPage(1440, 900);
+  await page.getByRole("button", { name: "Connect wallet" }).click();
+  await page.getByRole("button", { name: "Mock Wallet" }).click();
+  await page.waitForSelector("text=ALPHA", { timeout: 15000 });
+  check(await page.getByRole("heading", { name: "Owner setup" }).isVisible(), "owner: setup panel shown to the owner");
+  check((await page.locator(".owner .pill-ok").count()) === 2, "owner: IMD route and feed marked Set");
+  check(await page.getByText("5 of 6").isVisible(), "owner: 5 of 6 launched tokens registered");
+  check(await page.getByRole("button", { name: "Set up for this wallet (2 transactions)" }).isEnabled(), "owner: registering the held unregistered token is 2 transactions");
+  check(await page.getByRole("button", { name: "Register all 1 launched tokens (2 transactions)" }).isEnabled(), "owner: register-all offered");
+  await page.screenshot({ path: path.join(OUT, "1440-owner-setup.png"), fullPage: true });
+  await page.getByRole("button", { name: "Set up for this wallet (2 transactions)" }).click();
+  await page.waitForSelector("text=Done. 2 transactions confirmed.", { timeout: 20000 });
+  const reg = sent.slice(-2).map((t) => decodeFunctionData({ abi: swarmExitAbi, data: t.data }));
+  check(reg[0]?.functionName === "setSwarmToken" && reg[0].args[0].toLowerCase() === T.epsilon && reg[0].args[1] === true, "owner: setSwarmToken(EPSILON, true) sent");
+  check(reg[1]?.functionName === "setTokenRoute" && reg[1].args[1] === 3 && reg[1].args[2].toLowerCase() === "0x000000000004444c5dc75cb358380d2e3de08a90", "owner: setTokenRoute(EPSILON, v4, PoolManager, …) sent");
+  check(errors.length === 0, `owner: no console/page errors (${errors.join("; ")})`);
+  await ctx.close();
+  ownerIsUser = false;
 }
 
 await browser.close();

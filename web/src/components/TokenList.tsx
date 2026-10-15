@@ -34,10 +34,16 @@ function StatusCell({ t }: { t: SwarmToken }) {
     );
   }
   if (t.sellable) return <span className="pill pill-route">{t.routeLabel ?? "Route found"}</span>;
+  const launched = t.launch ? `Launch ${t.launch.id}, Uniswap v4 pool. ` : "";
   return (
     <>
       <span className="pill pill-muted">No sell route found</span>
-      <span className="note">{t.routeLabel ? `${t.routeLabel}: ${STATUS_TEXT[t.status] ?? "not sellable"}` : (STATUS_TEXT[t.status] ?? "Not sellable")}</span>
+      <span className="note">
+        {launched}
+        {t.routeLabel ? `${t.routeLabel}: ${STATUS_TEXT[t.status] ?? "not sellable"}` : (STATUS_TEXT[t.status] ?? "Not sellable")}
+        {t.status === 1 && t.quoteSource === "pool" ? ", though its pool would buy it" : ""}
+        {t.status === 1 && t.quoteSource === null && t.launch ? ", and its pool holds no IMD to buy it with" : ""}
+      </span>
     </>
   );
 }
@@ -77,7 +83,8 @@ export function TokenList({ tokens, pricing, selected, onToggle, onClaim, claimi
             </tr>
           )}
           {tokens.map((t) => {
-            const usd = t.sellable ? usdValue(t.expectedImd, pricing) : null;
+            const quoted = t.quoteSource !== null;
+            const usd = quoted ? usdValue(t.expectedImd, pricing) : null;
             const pickable = t.sellable && !busy && t.result === undefined;
             const id = `pick-${t.address}`;
             return (
@@ -114,15 +121,16 @@ export function TokenList({ tokens, pricing, selected, onToggle, onClaim, claimi
                   )}
                 </td>
                 <td className="num" data-label="Value">
-                  {t.sellable ? (
+                  {quoted ? (
                     <>
                       <span className="value-usd">{pricing ? fmtUsd(usd) : "USD n/a"}</span>
                       <span className="note">
                         {fmtAmount(t.expectedImd)} {IMD_SYMBOL}
+                        {t.quoteSource === "pool" ? " if registered" : ""}
                       </span>
                     </>
                   ) : (
-                    <span className="note">–</span>
+                    <span className="note">No buyer in the pool</span>
                   )}
                 </td>
                 <td data-label="Status" className="status">

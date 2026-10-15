@@ -59,7 +59,17 @@ Every function below is owner-only and emits an event. Until they are set, `sell
 
 The Uniswap and Chainlink addresses above are mainnet deployments checked on 2026-10-13 with `cast code` and reads (`WETH9()`, `factory()`, `symbol()`); no chain table was supplied to this task, so re-check before setting them. The v4 PoolManager address is the published Uniswap v4 mainnet deployment and was not re-checked from this machine.
 
-Website: the deployed SwarmExit address is fixed in `web/src/config.ts` (`SWARM_EXIT_ADDRESS`), taken from the launch's deployment record. Until the owner registers tokens and sets the IMD route and price feed, the site lists no tokens and shows "USD values unavailable".
+Website: the deployed SwarmExit address is fixed in `web/src/constants.ts` (`SWARM_EXIT_ADDRESS`), taken from the launch's deployment record. The site lists every swarm token a wallet holds whether or not the owner has registered it (see "Swarm token discovery"), but the contract can only sell registered tokens: the owner wallet sees an "Owner setup" panel on the site that sends the setters above with values read from the chain (the launch pool of each token as its v4 route, the ETH/IMD v4 pool with liquidity as the IMD route, the Chainlink ETH/USD feed).
+
+## Swarm token discovery (the 2026-10-15 review)
+
+The review request said the site could not read a wallet and identify swarm-launched tokens. Cause: the site only listed tokens registered in SwarmExit (`previewAll`), and on 2026-10-15 the live contract had zero registered tokens, no IMD route and no price feed (`swarmTokenCount() == 0`, `imdRoute().venue == 0`, `ethUsdFeed() == 0`). Nothing was ever registered after deployment, so every wallet read as empty.
+
+Fix: the site now identifies swarm tokens from the chain itself. Every swarm launch goes through the IdentityMD launch factory `0xff03410d0fe5fa8f7f59f743de35e333d9857120`, the contract that deployed SwarmExit (the `to` of the deployment record's `txHash`; `web/src/constants.ts` `LAUNCH_FACTORY_ADDRESS`). Before trusting it the site checks `factory.deploymentBlock(1682) == 26188854`, the launch id and block from the deployment record. `factory.positionOf(launchId)` returns the Uniswap v4 pool key of each token launch (currency0, currency1, fee 12500, tick spacing 60, the launch hook `0x784F…6000`) and the requester; the swarm token is the pool currency that is not a pair currency (IMD, FWA or ETH). The site scans launch ids from 1 in JSON-RPC batches of 100 `eth_call`s (`web/src/lib/launches.ts`), stops after 400 consecutive empty ids, and unions the result with `swarmTokens()` from the contract. For every token the wallet holds it then calls `preview(user, tokens)` on SwarmExit (sellability as the contract sees it) and, for tokens not registered yet, quotes the whole balance through the launch pool with the Uniswap v4 Quoter `0x52f0…1203` (chain table), so the holder sees what the token is worth and whether anyone is buying. USD values use the contract's `quoteImdInBridge` and `ethUsdPrice` when configured, otherwise the ETH/IMD v4 pool with the most liquidity (probed through StateView `0x7ffe…7227` over the 0.05%, 0.3% and 1% hookless tiers) and the Chainlink ETH/USD feed `0x5f4e…8419`, which the site accepts only if its `description()` is "ETH / USD".
+
+Test case, the launch owner `0x0acE1DBE8AAb293cd58D5e3Ea38814f0ccb74782`, read through the site's own code (`node --experimental-strip-types web/scripts/read-wallet.mjs`, 2026-10-15): 187 token launches known (ids 737 to 1888), 142 held by the wallet, 1 with a buyer in its pool (PLEA, launch 1609: 76,775 PLEA quoted at 0.1912 IMD, about $1.29), 0 sellable through the contract until the owner registers them. Every other held token sits in a launch pool nobody has bought from, so the pool holds no IMD to pay for a sale: the v4 Quoter reverts and `preview` reports `QuoteFailed`. Those rows are greyed out as "No sell route found" with the reason. Tokens paired with FWA have no route to IMD and are listed the same way.
+
+Checks 2 to 4 of the review ran on a mainnet fork of the live contract (`test/fork/SwarmExitMainnet.t.sol`, see Validation): the owner registers PLEA, NECTAR and COMB with their launch pools and sets the IMD route and feed, then one `sellAll` returns one cumulative gross of 0.191169797402410816 IMD, a tax of exactly 2% (0.003823395948048216 IMD) credited to the treasury, the rest (0.187346401454362600 IMD) credited to the seller, nothing left in the contract, and the two unsellable tokens skipped before any pull with their balances unchanged. The refund path (a sale that reverts after the pull) cannot be forced on real pools; it is covered by the unit tests with honeypot, refund-blocking and no-liquidity mocks (`test/SwarmExitEdges.t.sol`), and a sale below the caller's minimum was shown on the fork to revert with `NothingSold` and move nothing.
 
 ## Trust assumptions and limits
 
@@ -93,10 +103,11 @@ A single page at `dist/index.html`. The visitor connects a wallet (browser exten
 
 ```
 cd web
-npm install                 # Node 24 was used; installs React, wagmi, viem, Vite, TypeScript
+npm ci                      # Node 24 was used; installs React, wagmi, viem, Vite, TypeScript from the lockfile
 npm run dev                 # local dev server
 npm run build               # typecheck (tsc --noEmit) then vite build into ../dist
 npm run preview             # serves the built dist/
+node --experimental-strip-types scripts/read-wallet.mjs [address]   # reads a wallet through the site's code against mainnet
 ```
 
 `dist/` is committed and must be rebuilt and committed after any change under `web/`. The export uses relative asset URLs (`base: "./"`) so it works at an IPFS gateway subpath or an ENS name; there is no server-side routing.
@@ -109,8 +120,10 @@ The share image `web/public/og.png` is rendered from `web/scripts/og.html` with 
 
 Run on 2026-10-15 against the final source (details, findings and limitations in `artifacts/validation.md`):
 
-- `npx tsc --noEmit`: no errors. `npx vite build`: success (one chunk-size warning for the 623 kB wallet bundle).
-- ABI hash check: matches the deployment record.
-- Design probe `taste.mjs` on `dist/`: 16 of 16 checks passed at 320, 390 and 1440 wide.
-- Interaction script `node --experimental-strip-types web/scripts/interact.mjs` (Playwright, Chromium; serves `dist/`, mocks the RPC and an EIP-6963 wallet): all checks passed, covering the first screen at 390, keyboard and focus handling of the connect sheet, phone "Open in" links, connect, route identification, greyed rows, USD values, selection, confirmation totals, approvals and `sellAll` arguments, Sold/Unsold marks, and reflow at 320. Screenshots in `artifacts/screenshots/`.
-- Not performed: a real on-chain sale (the live contract has no tokens or routes registered yet), WebKit/Safari, screen readers, 200% zoom.
+- `npx tsc --noEmit`: no errors. `npx vite build`: success (one chunk-size warning for the 636 kB wallet bundle).
+- ABI hash check `node --experimental-strip-types web/scripts/check-abi.mjs`: matches the deployment record.
+- `forge build`, `forge test` (128 unit, edge, invariant and fuzz tests): all pass. `MAINNET_RPC_URL=https://ethereum-rpc.publicnode.com forge test --match-contract SwarmExitMainnet`: 3 fork tests pass against the live contract and real pools (figures above).
+- Live wallet read of the test case through `web/scripts/read-wallet.mjs`: 187 launches, 142 held, 1 with a buyer (above). Discovery took 71 s and the wallet read 41 s on the free public RPC, which rate-limits batches; the page shows "Reading your wallet…" meanwhile. A faster RPC in `web/src/chain.ts` removes the wait.
+- Design probe `taste.mjs` on `dist/`: 16 of 16 checks passed at 320, 390 and 1440 wide (an earlier run failed copy-budget at 63 words; the summary label was shortened).
+- Interaction script `node --experimental-strip-types web/scripts/interact.mjs` (Playwright, Chromium; serves `dist/`, mocks the RPC, the launch factory, the v4 Quoter and an EIP-6963 wallet): all checks passed, covering the first screen at 390, keyboard and focus handling of the connect sheet, phone "Open in" links, connect, launch discovery, pool quotes for an unregistered token, route identification, greyed rows, USD values, selection, confirmation totals, approvals and `sellAll` arguments, Sold/Unsold marks, reflow at 320, and the owner panel (hidden for a holder, shown to the owner, sends `setSwarmToken` then `setTokenRoute`). Screenshots in `artifacts/screenshots/`.
+- Not performed: a real on-chain sale (needs the owner to register tokens first; the fork rehearsal stands in), WebKit/Safari, screen readers, 200% zoom.

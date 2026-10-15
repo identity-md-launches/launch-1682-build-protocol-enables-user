@@ -201,7 +201,7 @@ main {
 
 .summary {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: var(--space-4);
 }
 
@@ -227,6 +227,19 @@ main {
 .hint {
   color: var(--color-text-secondary);
   font-size: var(--text-sm);
+  text-wrap: pretty;
+}
+
+.checks {
+  list-style: none;
+  padding: 0;
+  display: grid;
+  gap: var(--space-2);
+  font-size: var(--text-sm);
+}
+
+.checks li .pill {
+  margin-inline-end: var(--space-2);
 }
 
 .status-line {
@@ -655,9 +668,6 @@ main {
 @media (max-width: 639px) {
   .summary {
     grid-template-columns: 1fr 1fr;
-  }
-  .summary div:last-child {
-    grid-column: 1 / -1;
   }
   .actions .btn-primary {
     flex: 1 1 100%;

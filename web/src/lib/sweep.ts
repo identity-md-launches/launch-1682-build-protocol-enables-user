@@ -1,24 +1,34 @@
 // Reads and writes against SwarmExit. Every function here takes viem clients and returns plain data;
 // the components decide how to show it.
 import { parseEventLogs, parseUnits, type Address, type Hash, type PublicClient, type WalletClient } from "viem";
-import { swarmExitAbi } from "../abi/swarmExit";
-import { erc20Abi } from "../abi/erc20";
+import { swarmExitAbi } from "../abi/swarmExit.ts";
+import { erc20Abi } from "../abi/erc20.ts";
+import { aggregatorAbi, stateViewAbi, v4QuoterAbi } from "../abi/v4.ts";
 import {
   BPS,
+  CHAINLINK_ETH_USD_ADDRESS,
+  CHAINLINK_ETH_USD_DESCRIPTION,
   DEADLINE_SECONDS,
   DEFAULT_MAX_TOKENS_PER_SALE,
+  ETH_IMD_FEE_TIERS,
   FEE_BPS,
   IMD_ADDRESS,
   IMD_DECIMALS,
+  MAX_PRICE_AGE_SECONDS,
+  NATIVE,
+  PREVIEW_CHUNK,
   SLIPPAGE_BPS,
+  STATE_VIEW_ADDRESS,
   SWARM_EXIT_ADDRESS,
-} from "../config";
-import { short } from "./format";
+  V4_QUOTER_ADDRESS,
+} from "../constants.ts";
+import { discoverLaunches, nullOnRevert, poolId, type Launch, type PoolKey } from "./launches.ts";
+import { short } from "./format.ts";
 
 /** SwarmExit.Status, in declaration order. */
 export const STATUS_TEXT = [
   "Sellable",
-  "Not a swarm token",
+  "Not registered in SwarmExit yet",
   "No balance",
   "No sale route configured",
   "IMD route not configured",
@@ -29,6 +39,8 @@ export const STATUS_TEXT = [
   "Not approved",
 ] as const;
 export const STATUS_SOLD = 0;
+export const STATUS_NOT_REGISTERED = 1;
+export const STATUS_NO_ROUTE = 3;
 
 export type SellRoute = { venue: number; tokenOut: Address };
 
@@ -37,13 +49,17 @@ export type SwarmToken = {
   symbol: string;
   decimals: number;
   balance: bigint;
-  /** Expected IMD from the contract's preview (gross, before the fee). */
+  /** Expected IMD, gross before the fee: the contract's quote when registered, else the pool's. */
   expectedImd: bigint;
+  /** Where expectedImd came from; null when nothing could quote it. */
+  quoteSource: "contract" | "pool" | null;
   sellable: boolean;
   status: number;
   route: SellRoute | null;
   /** Human label of the sell route, or null when the contract has none for this token. */
   routeLabel: string | null;
+  /** The launch the factory recorded for this token, if any. */
+  launch: Launch | null;
   heldRefund: bigint;
   /** Set after a sale transaction. */
   result?: SaleResult;
@@ -53,7 +69,16 @@ export type SaleResult =
   | { kind: "sold"; imdOut: bigint; txHash: Hash }
   | { kind: "unsold"; reason: string; txHash?: Hash; held?: boolean };
 
-export type Pricing = { imdUsd: number; ethUsd: number };
+export type Pricing = { imdUsd: number; ethUsd: number; source: "contract" | "pool" };
+
+export type ContractSetup = {
+  owner: Address;
+  imdRouteSet: boolean;
+  feedSet: boolean;
+  registered: Address[];
+  /** The ETH/IMD pool with the most liquidity among the hookless fee tiers, or null. */
+  imdPool: PoolKey | null;
+};
 
 export type WalletState = {
   tokens: SwarmToken[];
@@ -62,7 +87,9 @@ export type WalletState = {
   paused: boolean;
   maxPerSale: number;
   minImdOut: bigint;
-  registered: number;
+  /** Every token launch the factory knows. */
+  launches: Launch[];
+  setup: ContractSetup;
 };
 
 export type PlanItem = { token: SwarmToken; imdOut: bigint };
@@ -95,59 +122,162 @@ export function feeSplit(gross: bigint) {
   return { fee, net: gross - fee };
 }
 
-async function loadPricing(client: PublicClient, account: Address): Promise<{ pricing: Pricing | null; error: string | null }> {
+/** The ETH/IMD v4 pool with the most liquidity among the standard hookless tiers. */
+export async function findImdPool(client: PublicClient): Promise<PoolKey | null> {
+  const keys: PoolKey[] = ETH_IMD_FEE_TIERS.map((t) => ({ currency0: NATIVE, currency1: IMD_ADDRESS, fee: t.fee, tickSpacing: t.tickSpacing, hooks: NATIVE }));
+  const liquidity = await Promise.all(
+    keys.map((k) => client.readContract({ address: STATE_VIEW_ADDRESS, abi: stateViewAbi, functionName: "getLiquidity", args: [poolId(k)] }).catch(() => 0n)),
+  );
+  let best = -1;
+  for (let i = 0; i < keys.length; i += 1) if (liquidity[i]! > 0n && (best < 0 || liquidity[i]! > liquidity[best]!)) best = i;
+  return best < 0 ? null : keys[best]!;
+}
+
+/** Sell quote of `amountIn` of the launch's token through its own pool, in the pair currency. */
+export async function quoteThroughPool(client: PublicClient, key: PoolKey, tokenIn: Address, amountIn: bigint): Promise<bigint | null> {
+  if (amountIn <= 0n || amountIn > 2n ** 128n - 1n) return null;
+  try {
+    const { result } = await client.simulateContract({
+      address: V4_QUOTER_ADDRESS,
+      abi: v4QuoterAbi,
+      functionName: "quoteExactInputSingle",
+      args: [{ poolKey: key, zeroForOne: same(tokenIn, key.currency0), exactAmount: amountIn, hookData: "0x" }],
+    });
+    return result[0];
+  } catch {
+    return null;
+  }
+}
+
+async function loadPricing(client: PublicClient, account: Address, imdPool: PoolKey | null): Promise<{ pricing: Pricing | null; error: string | null }> {
+  const oneImd = parseUnits("1", IMD_DECIMALS);
+  // The contract's own pricing, once the owner has set the IMD route and the feed.
   try {
     const [{ result: bridgePerImd }, [price, decimals]] = await Promise.all([
-      client.simulateContract({ ...exit, functionName: "quoteImdInBridge", args: [parseUnits("1", IMD_DECIMALS)], account }),
+      client.simulateContract({ ...exit, functionName: "quoteImdInBridge", args: [oneImd], account }),
       client.readContract({ ...exit, functionName: "ethUsdPrice" }),
     ]);
     const ethUsd = Number(price) / 10 ** Number(decimals);
-    const imdUsd = (Number(bridgePerImd) / 1e18) * ethUsd;
-    return { pricing: { imdUsd, ethUsd }, error: null };
+    return { pricing: { imdUsd: (Number(bridgePerImd) / 1e18) * ethUsd, ethUsd, source: "contract" }, error: null };
+  } catch {
+    /* not configured yet: price from the pool and the feed directly */
+  }
+  try {
+    if (!imdPool) throw new Error("No ETH/IMD pool with liquidity was found.");
+    const feed = { address: CHAINLINK_ETH_USD_ADDRESS, abi: aggregatorAbi } as const;
+    const [ethPerImd, description, decimals, round] = await Promise.all([
+      quoteThroughPool(client, imdPool, IMD_ADDRESS, oneImd),
+      client.readContract({ ...feed, functionName: "description" }),
+      client.readContract({ ...feed, functionName: "decimals" }),
+      client.readContract({ ...feed, functionName: "latestRoundData" }),
+    ]);
+    if (description !== CHAINLINK_ETH_USD_DESCRIPTION) throw new Error(`The price feed describes itself as "${description}", not "${CHAINLINK_ETH_USD_DESCRIPTION}".`);
+    const [, answer, , updatedAt] = round;
+    if (answer <= 0n) throw new Error("The price feed returned no price.");
+    if (Math.floor(Date.now() / 1000) - Number(updatedAt) > MAX_PRICE_AGE_SECONDS) throw new Error("The ETH/USD price is stale.");
+    if (ethPerImd === null) throw new Error("IMD could not be priced in ETH.");
+    const ethUsd = Number(answer) / 10 ** Number(decimals);
+    return { pricing: { imdUsd: (Number(ethPerImd) / 1e18) * ethUsd, ethUsd, source: "pool" }, error: null };
   } catch (e) {
     return { pricing: null, error: e instanceof Error ? e.message.split("\n")[0]! : String(e) };
   }
 }
 
+type PreviewRow = { token: Address; balance: bigint; expectedImd: bigint; sellable: boolean; status: number };
+
+async function previewChunked(client: PublicClient, account: Address, tokens: Address[]): Promise<Map<string, PreviewRow>> {
+  const out = new Map<string, PreviewRow>();
+  for (let i = 0; i < tokens.length; i += PREVIEW_CHUNK) {
+    const chunk = tokens.slice(i, i + PREVIEW_CHUNK);
+    try {
+      const { result } = await client.simulateContract({ ...exit, functionName: "preview", args: [account, chunk], account });
+      for (const p of result) out.set(p.token.toLowerCase(), { ...p, status: Number(p.status) });
+    } catch {
+      // one token at a time, so a single reverting token cannot hide the others
+      for (const t of chunk) {
+        try {
+          const { result } = await client.simulateContract({ ...exit, functionName: "preview", args: [account, [t]], account });
+          for (const p of result) out.set(p.token.toLowerCase(), { ...p, status: Number(p.status) });
+        } catch {
+          out.set(t.toLowerCase(), { token: t, balance: 0n, expectedImd: 0n, sellable: false, status: 5 });
+        }
+      }
+    }
+  }
+  return out;
+}
+
 /** Everything the page shows for one wallet: its swarm tokens, routes, previews and prices. */
 export async function loadWallet(client: PublicClient, account: Address): Promise<WalletState> {
-  const [paused, maxPerSaleRaw, minImdOut, { result: previews }, priced] = await Promise.all([
+  const [launches, registered, owner, paused, maxPerSaleRaw, minImdOut, imdRoute, feed, imdPool] = await Promise.all([
+    discoverLaunches(client),
+    client.readContract({ ...exit, functionName: "swarmTokens" }),
+    client.readContract({ ...exit, functionName: "owner" }),
     client.readContract({ ...exit, functionName: "paused" }).catch(() => false),
     client.readContract({ ...exit, functionName: "MAX_TOKENS_PER_SALE" }).catch(() => BigInt(DEFAULT_MAX_TOKENS_PER_SALE)),
     client.readContract({ ...exit, functionName: "minImdOut" }).catch(() => 0n),
-    client.simulateContract({ ...exit, functionName: "previewAll", args: [account], account }),
-    loadPricing(client, account),
+    client.readContract({ ...exit, functionName: "imdRoute" }).catch(() => null),
+    client.readContract({ ...exit, functionName: "ethUsdFeed" }).catch(() => NATIVE),
+    findImdPool(client),
   ]);
 
-  const held = await Promise.all(
-    previews.map((p) => client.readContract({ ...exit, functionName: "heldRefunds", args: [account, p.token] }).catch(() => 0n)),
-  );
+  // The universe: every factory launch plus anything the owner registered by hand.
+  const byToken = new Map<string, Launch | null>();
+  for (const l of launches) byToken.set(l.token.toLowerCase(), l);
+  for (const t of registered) if (!byToken.has(t.toLowerCase())) byToken.set(t.toLowerCase(), null);
+  const universe = [...byToken.keys()] as Address[];
+
+  const [balances, held] = await Promise.all([
+    Promise.all(universe.map((t) => client.readContract({ address: t, abi: erc20Abi, functionName: "balanceOf", args: [account] }).catch((e) => nullOnRevert(e) ?? 0n))),
+    Promise.all(universe.map((t) => client.readContract({ ...exit, functionName: "heldRefunds", args: [account, t] }).catch((e) => nullOnRevert(e) ?? 0n))),
+  ]);
   // Only what the wallet actually holds (or has waiting as a held refund) is listed.
-  const inWallet = previews.map((p, i) => ({ p, heldRefund: held[i]! })).filter(({ p, heldRefund }) => p.balance > 0n || heldRefund > 0n);
+  const inWallet = universe.map((t, i) => ({ t, balance: balances[i]!, heldRefund: held[i]! })).filter((x) => x.balance > 0n || x.heldRefund > 0n);
+
+  const [previews, priced] = await Promise.all([
+    previewChunked(client, account, inWallet.map((x) => x.t)),
+    loadPricing(client, account, imdPool),
+  ]);
 
   const tokens = await Promise.all(
-    inWallet.map(async ({ p, heldRefund }): Promise<SwarmToken> => {
-      const erc = { address: p.token, abi: erc20Abi } as const;
+    inWallet.map(async ({ t, balance, heldRefund }): Promise<SwarmToken> => {
+      const erc = { address: t, abi: erc20Abi } as const;
+      const launch = byToken.get(t.toLowerCase()) ?? null;
+      const p = previews.get(t.toLowerCase());
+      const isRegistered = registered.some((r) => same(r, t));
       const [symbol, decimals, routeRaw] = await Promise.all([
-        client.readContract({ ...erc, functionName: "symbol" }).catch(() => short(p.token)),
+        client.readContract({ ...erc, functionName: "symbol" }).catch(() => short(t)),
         client.readContract({ ...erc, functionName: "decimals" }).catch(() => 18),
-        client.readContract({ ...exit, functionName: "tokenRoute", args: [p.token] }).catch(() => null),
+        isRegistered ? client.readContract({ ...exit, functionName: "tokenRoute", args: [t] }).catch(() => null) : Promise.resolve(null),
       ]);
       const route: SellRoute | null = routeRaw && routeRaw.venue !== 0 ? { venue: routeRaw.venue, tokenOut: routeRaw.tokenOut } : null;
+      let expectedImd = p?.expectedImd ?? 0n;
+      let quoteSource: SwarmToken["quoteSource"] = p && p.status === STATUS_SOLD ? "contract" : null;
+      // Not registered yet: quote through the launch pool so the holder still sees what it is worth.
+      if (!isRegistered && launch && same(launch.pair, IMD_ADDRESS) && balance > 0n) {
+        const q = await quoteThroughPool(client, launch.key, t, balance);
+        if (q !== null && q > 0n) {
+          expectedImd = q;
+          quoteSource = "pool";
+        }
+      }
       return {
-        address: p.token,
+        address: t,
         symbol: String(symbol).slice(0, 32),
         decimals: Number(decimals),
-        balance: p.balance,
-        expectedImd: p.expectedImd,
-        sellable: p.sellable,
-        status: Number(p.status),
+        balance,
+        expectedImd,
+        quoteSource,
+        sellable: p?.sellable ?? false,
+        status: p?.status ?? STATUS_NOT_REGISTERED,
         route,
         routeLabel: describeRoute(route),
+        launch,
         heldRefund,
       };
     }),
   );
+  tokens.sort((a, b) => Number(b.sellable) - Number(a.sellable) || Number(b.expectedImd > a.expectedImd) - Number(a.expectedImd > b.expectedImd));
 
   return {
     tokens,
@@ -156,7 +286,14 @@ export async function loadWallet(client: PublicClient, account: Address): Promis
     paused,
     maxPerSale: Number(maxPerSaleRaw),
     minImdOut,
-    registered: previews.length,
+    launches,
+    setup: {
+      owner,
+      imdRouteSet: !!imdRoute && imdRoute.venue !== 0,
+      feedSet: !same(feed, NATIVE),
+      registered: [...registered],
+      imdPool,
+    },
   };
 }
 
@@ -202,11 +339,15 @@ export async function planSale(client: PublicClient, account: Address, chosen: S
     for (const t of selected) {
       const o = outcomes.find((x) => same(x.token, t.address));
       if (settles(o, minImdOut)) items.push({ token: t, imdOut: o!.imdOut });
-      else excluded.push({ token: t, reason: "The sale would fail or yield nothing on chain." });
+      else excluded.push({ token: t, reason: o ? (STATUS_TEXT[o.status] ?? "The sale would fail on chain.") : "The sale would fail or yield nothing on chain." });
     }
     break;
   }
-  if (items.length === 0 && selected.length > 0) items = selected.map((t) => ({ token: t, imdOut: t.expectedImd }));
+  // The dry run without allowances reports NoAllowance for every token; fall back to the previews.
+  if (items.length === 0 && selected.length > 0 && excluded.every((x) => x.reason === STATUS_TEXT[9])) {
+    items = selected.map((t) => ({ token: t, imdOut: t.expectedImd }));
+    excluded.length = 0;
+  }
 
   const gross = items.reduce((s, i) => s + i.imdOut, 0n);
   const { fee, net } = feeSplit(gross);
@@ -250,11 +391,26 @@ export async function executeSale(
     await client.waitForTransactionReceipt({ hash });
   }
 
+  // With allowances in place the dry run is exact: take its outputs as the minimums' base.
   const batches: PlanItem[][] = [];
   for (let i = 0; i < plan.items.length; i += maxPerSale) batches.push(plan.items.slice(i, i + maxPerSale));
 
   for (let b = 0; b < batches.length; b += 1) {
-    const batch = batches[b]!;
+    let batch = batches[b]!;
+    try {
+      const { result } = await client.simulateContract({
+        ...exit,
+        functionName: "sellAll",
+        args: [batch.map((i) => i.token.address), batch.map(() => 0n), deadline()],
+        account,
+      });
+      batch = batch.map((i) => {
+        const o = result[0].find((x) => same(x.token, i.token.address));
+        return o && o.status === STATUS_SOLD && o.imdOut > 0n ? { ...i, imdOut: o.imdOut } : i;
+      });
+    } catch {
+      /* keep the plan's figures; the contract still enforces the minimums */
+    }
     onProgress({ step: "sign", batch: b + 1, batches: batches.length });
     let hash: Hash;
     try {

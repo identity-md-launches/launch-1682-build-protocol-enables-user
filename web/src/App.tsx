@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useAccount, useChainId, usePublicClient, useWalletClient } from "wagmi";
 import { chain } from "./chain";
-import { EXPLORER_URL, IMD_SYMBOL, SWARM_EXIT_ADDRESS } from "./config";
+import { EXPLORER_URL, IMD_SYMBOL, LAUNCH_FACTORY_ADDRESS, SWARM_EXIT_ADDRESS } from "./config";
 import { ConnectSheet } from "./wallet/ConnectSheet";
 import { TokenList } from "./components/TokenList";
 import { ConfirmDialog } from "./components/ConfirmDialog";
+import { OwnerSetup } from "./components/OwnerSetup";
 import { errorText, fmtAmount, fmtUsd, short } from "./lib/format";
 import { claimRefund, executeSale, feeSplit, loadWallet, planSale, usdValue, type Plan, type Progress, type SwarmToken, type WalletState } from "./lib/sweep";
 
@@ -54,8 +55,11 @@ export function App() {
   const chosen = useMemo(() => sellable.filter((t) => selected.has(t.address.toLowerCase())), [sellable, selected]);
   const grossAll = sellable.reduce((s, t) => s + t.expectedImd, 0n);
   const { net: netAll } = feeSplit(grossAll);
-  const totalUsd = state?.pricing ? usdValue(grossAll, state.pricing) : null;
+  // Every held token with a quote, sellable or not yet registered, counts toward the wallet's value.
+  const valueAll = tokens.filter((t) => t.result === undefined && t.quoteSource !== null).reduce((s, t) => s + t.expectedImd, 0n);
+  const totalUsd = state?.pricing ? usdValue(valueAll, state.pricing) : null;
   const busy = planning || (sale !== null && sale.progress !== null && sale.error === null);
+  const isOwner = !!state && !!address && state.setup.owner.toLowerCase() === address.toLowerCase();
 
   const toggle = (addr: string) => {
     const k = addr.toLowerCase();
@@ -130,6 +134,8 @@ export function App() {
   };
 
   const sellDisabled = !onChain || busy || loading || state?.paused === true;
+  const unregisteredHeld = tokens.filter((t) => t.result === undefined && t.status === 1).length;
+  const pricingHint = state?.pricingError ? `USD values unavailable: ${state.pricingError}` : "";
 
   return (
     <>
@@ -154,7 +160,11 @@ export function App() {
             </h2>
             <dl className="summary">
               <div>
-                <dt>Sellable tokens</dt>
+                <dt>Swarm tokens held</dt>
+                <dd>{state ? tokens.filter((t) => t.balance > 0n).length : "–"}</dd>
+              </div>
+              <div>
+                <dt>Sellable now</dt>
                 <dd>{state ? sellable.length : "–"}</dd>
               </div>
               <div>
@@ -162,7 +172,7 @@ export function App() {
                 <dd>{state ? (state.pricing ? fmtUsd(totalUsd) : "USD n/a") : "–"}</dd>
               </div>
               <div>
-                <dt>You receive, after the 2% fee</dt>
+                <dt>Yours after the 2% fee</dt>
                 <dd>{state ? `${fmtAmount(netAll)} ${IMD_SYMBOL}` : "–"}</dd>
               </div>
             </dl>
@@ -187,9 +197,18 @@ export function App() {
             </div>
 
             <p className="status-line" role="status" aria-live="polite">
-              {notice || loadError || (state?.pricingError ? "USD values unavailable: the IMD route or price feed is not configured yet." : "")}
+              {notice ||
+                loadError ||
+                (state && unregisteredHeld > 0 && !isOwner
+                  ? `${unregisteredHeld} of your tokens are not registered in SwarmExit yet; the contract owner has to register them before they can be sold here.`
+                  : "") ||
+                pricingHint}
             </p>
           </section>
+
+          {isOwner && state && address && (
+            <OwnerSetup state={state} wallet={wallet} client={client} account={address} busy={busy || loading} onDone={() => void refresh()} />
+          )}
 
           <TokenList
             tokens={tokens}
@@ -210,8 +229,12 @@ export function App() {
             <a className="mono" href={`${EXPLORER_URL}/address/${SWARM_EXIT_ADDRESS}`} target="_blank" rel="noreferrer">
               {short(SWARM_EXIT_ADDRESS)}
             </a>{" "}
-            on {chain.name}. Tokens never rest in the contract: a failed sale is refunded in the same transaction. Prefer a private RPC
-            such as Flashbots Protect to avoid sandwiching.
+            on {chain.name}. Swarm tokens are read from the launch factory{" "}
+            <a className="mono" href={`${EXPLORER_URL}/address/${LAUNCH_FACTORY_ADDRESS}`} target="_blank" rel="noreferrer">
+              {short(LAUNCH_FACTORY_ADDRESS)}
+            </a>
+            . Tokens never rest in the contract: a failed sale is refunded in the same transaction. Prefer a private RPC such as Flashbots
+            Protect to avoid sandwiching.
           </p>
         </footer>
       </div>
