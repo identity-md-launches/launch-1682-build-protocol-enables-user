@@ -1,9 +1,9 @@
-# Swarm Exit
+# Swarm Exit and SwarmSweep
 
-One-click sale of every swarm-launched token in a wallet for $IMD on Ethereum mainnet.
+One-click sale of every swarm-launched token in a wallet for $IMD on Ethereum mainnet: the `SwarmExit` contract (live at `0x5c3c2a6d7d340db9f8b3e0cbbc8dbbb7ec73bc61`) and the SwarmSweep website that drives it.
 
 - `src/SwarmExit.sol`: the only launched contract (Solidity name `SwarmExit`, one constructor argument: the owner).
-- `web/`: static website (connect wallet, list swarm tokens with balances and USD values, highlight unsellable ones, sell all in one transaction, claim a held refund). Serve the folder with any static file server; `ethers` is vendored in `web/vendor/`.
+- `web/`: the SwarmSweep website source (Vite, React, TypeScript, wagmi, viem). `dist/`: its committed static export, the thing that gets published. See [Website](#website-swarmsweep) below, `DESIGN.md` for the design system and `artifacts/validation.md` for the validation record.
 - `test/`: Foundry tests with mock Uniswap V2 / V3 venues, a mock Uniswap v4 PoolManager (flash accounting, native ETH), WETH, honeypot, fee-on-transfer, refund-blocking, no-liquidity and reentrant tokens.
 - `script/Deploy.s.sol`: reviewable deployment function used by the tests. The IMD launch deploys from bytecode through its factory; nobody runs this script against mainnet for the launch.
 
@@ -38,8 +38,8 @@ The contract never keeps user tokens, ETH or IMD between transactions except hel
 | `IMPACT_PROBE_DIVISOR` | 1000 | The impact probe quotes 1/1000 of the holding |
 | `MAX_PRICE_AGE` | 3 hours | Oldest Chainlink answer accepted (feed heartbeat is 1 hour) |
 | `MAX_TOKENS_PER_SALE` | 50 | Tokens per `sellAll` call (the site batches above it) |
-| `web/config.js` `slippageBps` | 300 (3%) | Per-token minimum IMD = simulated output minus slippage |
-| `web/config.js` `deadlineSeconds` | 600 | Transaction deadline |
+| `web/src/config.ts` `SLIPPAGE_BPS` | 300 (3%) | Per-token minimum IMD = simulated output minus slippage |
+| `web/src/config.ts` `DEADLINE_SECONDS` | 600 | Transaction deadline |
 
 ## After launch (owner responsibilities)
 
@@ -59,7 +59,7 @@ Every function below is owner-only and emits an event. Until they are set, `sell
 
 The Uniswap and Chainlink addresses above are mainnet deployments checked on 2026-10-13 with `cast code` and reads (`WETH9()`, `factory()`, `symbol()`); no chain table was supplied to this task, so re-check before setting them. The v4 PoolManager address is the published Uniswap v4 mainnet deployment and was not re-checked from this machine.
 
-Website: put the deployed SwarmExit address from the launch handoff into `web/config.js` (`swarmExit`). The page also accepts it in its address field.
+Website: the deployed SwarmExit address is fixed in `web/src/config.ts` (`SWARM_EXIT_ADDRESS`), taken from the launch's deployment record. Until the owner registers tokens and sets the IMD route and price feed, the site lists no tokens and shows "USD values unavailable".
 
 ## Trust assumptions and limits
 
@@ -84,3 +84,33 @@ forge fmt --check
 The suite covers: owner and two-step ownership, registry add/remove (code check, route cleared on unregister), route validation (three venues), every preview status including price impact and a reverting `balanceOf`, the happy path with exact 2% / 98% split and zero residue, events, fee-on-transfer (V2 sale, v4 sale with the measured amount, pre-pull skip, execution-time refund), zero-balance and no-allowance skips, allowance-capped pull, honeypot refund with other tokens still sold, a pull the token refuses, a refund the token refuses (held, claimable, not rescuable), a route that pays nothing, the on-chain floor, no-liquidity and missing-bridge skips, nothing-sold revert, input validation, pause, self-call and callback guards, reentrancy from a malicious token, Chainlink checks, reversed V2 / V3 / v4 / multi-hop quoting, v4 direct and bridged sales in both wrap directions, v4 partial fills, rescue limits (tokens and ETH), the deploy function, runtime size and forbidden opcodes, and three fuzz tests (tax conservation on V2/V3 and v4, slippage guard).
 
 Tooling run: forge build, forge test (with the verifier's fuzz seed), forge fmt. Slither and Mythril were not available on this machine; the only `transferFrom` is made from `sellAll`'s loop with `msg.sender` as the source.
+
+## Website (SwarmSweep)
+
+A single page at `dist/index.html`. The visitor connects a wallet (browser extensions by EIP-6963, phones through the wallet's own browser, Coinbase Smart Wallet), the page reads every swarm-registered token the wallet holds through `previewAll`, identifies each token's sell route (`tokenRoute`: Uniswap V2, V3 or v4, direct to IMD or through ETH) and shows the balance, the expected IMD and its USD value (`quoteImdInBridge` times Chainlink `ethUsdPrice`). Tokens the contract cannot sell are greyed out with "No sell route found" and the reason. "Sell all" or tick rows and "Sell selected" dry-runs `sellAll` with `eth_call`, drops any token whose sale would fail, and opens a confirmation listing the tokens, the gross IMD, the 2% fee to the treasury and the net the user receives. On confirm the wallet asks for one approval per token (exact balance) and then the `sellAll` transaction, with per-token minimums 3% under the simulated outputs; the user pays the gas. From the receipt each token is marked "Sold" (green) or "Unsold" (red); a token whose sale failed on chain is refunded by the contract in the same transaction, and a refund the token refused can be claimed with the "Claim refund" button.
+
+### Install, preview, rebuild
+
+```
+cd web
+npm install                 # Node 24 was used; installs React, wagmi, viem, Vite, TypeScript
+npm run dev                 # local dev server
+npm run build               # typecheck (tsc --noEmit) then vite build into ../dist
+npm run preview             # serves the built dist/
+```
+
+`dist/` is committed and must be rebuilt and committed after any change under `web/`. The export uses relative asset URLs (`base: "./"`) so it works at an IPFS gateway subpath or an ENS name; there is no server-side routing.
+
+Regenerating the ABI after a change to `src/SwarmExit.sol`: `forge build` at the repository root, then `node web/scripts/gen-abi.mjs`. The committed ABI is checked against the deployment record's `abiHash` with `node --experimental-strip-types web/scripts/check-abi.mjs` (key-sorted JSON, keccak256).
+
+The share image `web/public/og.png` is rendered from `web/scripts/og.html` with `node web/scripts/make-og.mjs` (needs Playwright; see the script header).
+
+### Validation
+
+Run on 2026-10-15 against the final source (details, findings and limitations in `artifacts/validation.md`):
+
+- `npx tsc --noEmit`: no errors. `npx vite build`: success (one chunk-size warning for the 623 kB wallet bundle).
+- ABI hash check: matches the deployment record.
+- Design probe `taste.mjs` on `dist/`: 16 of 16 checks passed at 320, 390 and 1440 wide.
+- Interaction script `node --experimental-strip-types web/scripts/interact.mjs` (Playwright, Chromium; serves `dist/`, mocks the RPC and an EIP-6963 wallet): all checks passed, covering the first screen at 390, keyboard and focus handling of the connect sheet, phone "Open in" links, connect, route identification, greyed rows, USD values, selection, confirmation totals, approvals and `sellAll` arguments, Sold/Unsold marks, and reflow at 320. Screenshots in `artifacts/screenshots/`.
+- Not performed: a real on-chain sale (the live contract has no tokens or routes registered yet), WebKit/Safari, screen readers, 200% zoom.
