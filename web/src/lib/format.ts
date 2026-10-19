@@ -23,9 +23,20 @@ export const short = (a: string) => `${a.slice(0, 6)}…${a.slice(-4)}`;
 /** The one-line reason viem or a wallet gives for a failure. */
 export function errorText(e: unknown): string {
   if (e && typeof e === "object") {
+    // viem wraps the decoded contract error in an execution error. Prefer that reason over
+    // a transport's generic short message, without exposing request dumps or stack traces.
+    let cause: unknown = e;
+    let details: string | undefined;
+    for (let depth = 0; depth < 8 && cause && typeof cause === "object"; depth += 1) {
+      const o = cause as { data?: { errorName?: string }; reason?: string; details?: string; cause?: unknown };
+      if (o.reason) return o.reason.split("\n")[0]!;
+      if (o.data?.errorName) return o.data.errorName;
+      if (o.details) details = o.details.split("\n")[0];
+      cause = o.cause;
+    }
     const o = e as { shortMessage?: string; message?: string };
-    if (o.shortMessage) return o.shortMessage;
-    if (o.message) return o.message.split("\n")[0]!;
+    const message = (o.shortMessage ?? o.message)?.split("\n")[0];
+    if (message) return details && !message.includes(details) ? `${message} ${details}` : message;
   }
   return String(e);
 }

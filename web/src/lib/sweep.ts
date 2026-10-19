@@ -23,7 +23,8 @@ import {
   V4_QUOTER_ADDRESS,
 } from "../constants.ts";
 import { discoverLaunches, nullOnRevert, poolId, type Launch, type PoolKey } from "./launches.ts";
-import { short } from "./format.ts";
+import { errorText, fmtAmount, short } from "./format.ts";
+import { assertWalletContext, confirmedReceipt, transactionHash } from "./transactions.ts";
 
 /** SwarmExit.Status, in declaration order. */
 export const STATUS_TEXT = [
@@ -67,7 +68,7 @@ export type SwarmToken = {
 
 export type SaleResult =
   | { kind: "sold"; imdOut: bigint; txHash: Hash }
-  | { kind: "unsold"; reason: string; txHash?: Hash; held?: boolean };
+  | { kind: "unsold"; reason: string; txHash?: Hash; held?: boolean; heldAmount?: bigint };
 
 export type Pricing = { imdUsd: number; ethUsd: number; source: "contract" | "pool" };
 
@@ -76,6 +77,8 @@ export type ContractSetup = {
   imdRouteSet: boolean;
   feedSet: boolean;
   registered: Address[];
+  /** Configured routes for registered tokens; null means no route. */
+  routes: Record<string, SellRoute | null>;
   /** The ETH/IMD pool with the most liquidity among the hookless fee tiers, or null. */
   imdPool: PoolKey | null;
 };
@@ -92,7 +95,7 @@ export type WalletState = {
   setup: ContractSetup;
 };
 
-export type PlanItem = { token: SwarmToken; imdOut: bigint };
+export type PlanItem = { token: SwarmToken; imdOut: bigint; approvalRequired?: boolean; estimated?: boolean };
 export type Plan = {
   items: PlanItem[];
   excluded: { token: SwarmToken; reason: string }[];
@@ -227,6 +230,12 @@ export async function loadWallet(client: PublicClient, account: Address): Promis
   for (const t of registered) if (!byToken.has(t.toLowerCase())) byToken.set(t.toLowerCase(), null);
   const universe = [...byToken.keys()] as Address[];
 
+  const routeEntries = await Promise.all(registered.map(async (t) => {
+    const r = await client.readContract({ ...exit, functionName: "tokenRoute", args: [t] });
+    return [t.toLowerCase(), r.venue === 0 ? null : { venue: r.venue, tokenOut: r.tokenOut }] as const;
+  }));
+  const routes: ContractSetup["routes"] = Object.fromEntries(routeEntries);
+
   const [balances, held] = await Promise.all([
     Promise.all(universe.map((t) => client.readContract({ address: t, abi: erc20Abi, functionName: "balanceOf", args: [account] }).catch((e) => nullOnRevert(e) ?? 0n))),
     Promise.all(universe.map((t) => client.readContract({ ...exit, functionName: "heldRefunds", args: [account, t] }).catch((e) => nullOnRevert(e) ?? 0n))),
@@ -245,12 +254,11 @@ export async function loadWallet(client: PublicClient, account: Address): Promis
       const launch = byToken.get(t.toLowerCase()) ?? null;
       const p = previews.get(t.toLowerCase());
       const isRegistered = registered.some((r) => same(r, t));
-      const [symbol, decimals, routeRaw] = await Promise.all([
+      const [symbol, decimals] = await Promise.all([
         client.readContract({ ...erc, functionName: "symbol" }).catch(() => short(t)),
         client.readContract({ ...erc, functionName: "decimals" }).catch(() => 18),
-        isRegistered ? client.readContract({ ...exit, functionName: "tokenRoute", args: [t] }).catch(() => null) : Promise.resolve(null),
       ]);
-      const route: SellRoute | null = routeRaw && routeRaw.venue !== 0 ? { venue: routeRaw.venue, tokenOut: routeRaw.tokenOut } : null;
+      const route = routes[t.toLowerCase()] ?? null;
       let expectedImd = p?.expectedImd ?? 0n;
       let quoteSource: SwarmToken["quoteSource"] = p && p.status === STATUS_SOLD ? "contract" : null;
       // Not registered yet: quote through the launch pool so the holder still sees what it is worth.
@@ -292,6 +300,7 @@ export async function loadWallet(client: PublicClient, account: Address): Promis
       imdRouteSet: !!imdRoute && imdRoute.venue !== 0,
       feedSet: !same(feed, NATIVE),
       registered: [...registered],
+      routes,
       imdPool,
     },
   };
@@ -301,153 +310,175 @@ type Outcome = { token: Address; amountIn: bigint; imdOut: bigint; status: numbe
 
 const settles = (o: Outcome | undefined, floor: bigint) => !!o && o.status === STATUS_SOLD && o.imdOut > 0n && o.imdOut >= floor;
 
-/**
- * Dry run of sellAll with zero minimums. Sales execute one after another and share the IMD pool,
- * so the simulated outputs are the real quote. A token whose sale would fail is left out; if the
- * whole call reverts, each token is simulated alone to find the culprits and the rest is rerun.
- */
-export async function planSale(client: PublicClient, account: Address, chosen: SwarmToken[], minImdOut: bigint): Promise<Plan> {
+/** Missing full-balance allowances need approval before a meaningful sellAll dry run. */
+export async function planSale(
+  client: PublicClient, account: Address, chosen: SwarmToken[], minImdOut: bigint,
+  maxPerSale = DEFAULT_MAX_TOKENS_PER_SALE,
+): Promise<Plan> {
   const excluded: Plan["excluded"] = [];
-  let selected = chosen.slice();
-  let items: PlanItem[] = [];
-
-  for (let attempt = 0; attempt < 2 && selected.length > 0; attempt += 1) {
-    let outcomes: readonly Outcome[];
-    try {
-      const { result } = await client.simulateContract({
-        ...exit,
-        functionName: "sellAll",
-        args: [selected.map((t) => t.address), selected.map(() => 0n), deadline()],
-        account,
-      });
-      outcomes = result[0];
-    } catch {
-      const keep: SwarmToken[] = [];
-      for (const t of selected) {
-        try {
-          const { result } = await client.simulateContract({ ...exit, functionName: "sellAll", args: [[t.address], [0n], deadline()], account });
-          if (settles(result[0][0], minImdOut)) keep.push(t);
-          else excluded.push({ token: t, reason: "The sale would not settle on chain." });
-        } catch (e) {
-          excluded.push({ token: t, reason: `The sale reverts in simulation: ${e instanceof Error ? e.message.split("\n")[0] : e}` });
-        }
-      }
-      selected = keep;
+  const byToken = new Map<string, PlanItem>();
+  const approved: SwarmToken[] = [];
+  const allowances = await Promise.all(chosen.map(t => client.readContract({ address: t.address, abi: erc20Abi, functionName: "allowance", args: [account, SWARM_EXIT_ADDRESS] })));
+  for (const [index, t] of chosen.entries()) {
+    if (!t.sellable || t.expectedImd <= 0n || t.expectedImd < minImdOut) {
+      excluded.push({ token: t, reason: STATUS_TEXT[t.status] ?? "No usable sale quote. Refresh to try again." });
       continue;
     }
-    items = [];
-    for (const t of selected) {
-      const o = outcomes.find((x) => same(x.token, t.address));
-      if (settles(o, minImdOut)) items.push({ token: t, imdOut: o!.imdOut });
-      else excluded.push({ token: t, reason: o ? (STATUS_TEXT[o.status] ?? "The sale would fail on chain.") : "The sale would fail or yield nothing on chain." });
-    }
-    break;
-  }
-  // The dry run without allowances reports NoAllowance for every token; fall back to the previews.
-  if (items.length === 0 && selected.length > 0 && excluded.every((x) => x.reason === STATUS_TEXT[9])) {
-    items = selected.map((t) => ({ token: t, imdOut: t.expectedImd }));
-    excluded.length = 0;
+    if (allowances[index]! < t.balance) byToken.set(t.address.toLowerCase(), { token: t, imdOut: t.expectedImd, approvalRequired: true, estimated: true });
+    else approved.push(t);
   }
 
-  const gross = items.reduce((s, i) => s + i.imdOut, 0n);
-  const { fee, net } = feeSplit(gross);
-  return { items, excluded, gross, fee, net };
+  const simulate = async (tokens: SwarmToken[]) => {
+    const { result } = await client.simulateContract({ ...exit, functionName: "sellAll", args: [tokens.map(t => t.address), tokens.map(() => 0n), deadline()], account });
+    return result[0];
+  };
+  const record = (tokens: SwarmToken[], outcomes: readonly Outcome[]) => {
+    for (const t of tokens) {
+      const o = outcomes.find(x => same(x.token, t.address));
+      if (settles(o, minImdOut)) byToken.set(t.address.toLowerCase(), { token: t, imdOut: o!.imdOut });
+      else excluded.push({ token: t, reason: o ? (STATUS_TEXT[o.status] ?? "The sale would fail on chain.") : "The sale would not settle on chain." });
+    }
+  };
+  const size = Math.max(1, Math.min(maxPerSale, DEFAULT_MAX_TOKENS_PER_SALE));
+  for (let start = 0; start < approved.length; start += size) {
+    const batch = approved.slice(start, start + size);
+    try {
+      record(batch, await simulate(batch));
+    } catch {
+      // Isolate an actually reverting token, then re-quote the surviving batch together.
+      const keep: SwarmToken[] = [];
+      for (const t of batch) {
+        try {
+          const outcomes = await simulate([t]);
+          if (settles(outcomes[0], minImdOut)) keep.push(t);
+          else record([t], outcomes);
+        } catch (e) {
+          excluded.push({ token: t, reason: `The sale reverts in simulation: ${errorText(e)}` });
+        }
+      }
+      if (keep.length > 0) {
+        try { record(keep, await simulate(keep)); }
+        catch (e) { for (const t of keep) excluded.push({ token: t, reason: `The batch simulation failed: ${errorText(e)}` }); }
+      }
+    }
+  }
+  const items = chosen.flatMap(t => { const item = byToken.get(t.address.toLowerCase()); return item ? [item] : []; });
+  const gross = items.reduce((sum, i) => sum + i.imdOut, 0n);
+  return { items, excluded, gross, ...feeSplit(gross) };
 }
 
 export type Progress =
+  | { step: "check"; batch: number; batches: number }
   | { step: "approve"; token: SwarmToken; index: number; total: number }
   | { step: "sign"; batch: number; batches: number }
   | { step: "mine"; hash: Hash; batch: number; batches: number };
 
-/** Approves what is missing, sends sellAll in batches, and reports what happened to each token. */
+/** Keeps outcomes from earlier batches visible if a later check or wallet request fails. */
+export class SaleExecutionError extends Error {
+  readonly results: Map<string, SaleResult>;
+  readonly hash: Hash | null;
+  constructor(error: unknown, results: Map<string, SaleResult>) {
+    super(errorText(error));
+    this.results = new Map(results);
+    this.hash = transactionHash(error);
+  }
+}
+
+const minimum = (i: PlanItem) => (i.imdOut * (BPS - SLIPPAGE_BPS)) / BPS;
+
+/** Approves missing balances, validates the exact batch, then requests its sale signature. */
 export async function executeSale(
-  wallet: WalletClient,
-  client: PublicClient,
-  account: Address,
-  plan: Plan,
-  maxPerSale: number,
+  wallet: WalletClient, client: PublicClient, account: Address, plan: Plan, maxPerSale: number,
   onProgress: (p: Progress) => void,
 ): Promise<Map<string, SaleResult>> {
   const results = new Map<string, SaleResult>();
   const key = (a: string) => a.toLowerCase();
+  try {
+    const needing: SwarmToken[] = [];
+    for (const { token } of plan.items) {
+      const allowance = await client.readContract({ address: token.address, abi: erc20Abi, functionName: "allowance", args: [account, SWARM_EXIT_ADDRESS] });
+      if (allowance < token.balance) needing.push(token);
+    }
+    for (let i = 0; i < needing.length; i += 1) {
+      const token = needing[i]!;
+      await assertWalletContext(wallet, account);
+      onProgress({ step: "approve", token, index: i + 1, total: needing.length });
+      const hash = await wallet.writeContract({ address: token.address, abi: erc20Abi, functionName: "approve", args: [SWARM_EXIT_ADDRESS, token.balance], account, chain: wallet.chain });
+      await confirmedReceipt(client, hash, `Approval of ${token.symbol}`);
+    }
 
-  // Approvals: exact balance, so the contract can never pull more than what is being sold.
-  const needing: SwarmToken[] = [];
-  for (const { token } of plan.items) {
-    const allowance = await client.readContract({ address: token.address, abi: erc20Abi, functionName: "allowance", args: [account, SWARM_EXIT_ADDRESS] });
-    if (allowance < token.balance) needing.push(token);
-  }
-  for (let i = 0; i < needing.length; i += 1) {
-    const token = needing[i]!;
-    onProgress({ step: "approve", token, index: i + 1, total: needing.length });
-    const hash = await wallet.writeContract({
-      address: token.address,
-      abi: erc20Abi,
-      functionName: "approve",
-      args: [SWARM_EXIT_ADDRESS, token.balance],
-      account,
-      chain: wallet.chain,
-    });
-    await client.waitForTransactionReceipt({ hash });
-  }
-
-  // With allowances in place the dry run is exact: take its outputs as the minimums' base.
-  const batches: PlanItem[][] = [];
-  for (let i = 0; i < plan.items.length; i += maxPerSale) batches.push(plan.items.slice(i, i + maxPerSale));
-
-  for (let b = 0; b < batches.length; b += 1) {
-    let batch = batches[b]!;
-    try {
-      const { result } = await client.simulateContract({
-        ...exit,
-        functionName: "sellAll",
-        args: [batch.map((i) => i.token.address), batch.map(() => 0n), deadline()],
-        account,
+    const size = Math.max(1, Math.min(maxPerSale, DEFAULT_MAX_TOKENS_PER_SALE));
+    const batches: PlanItem[][] = [];
+    for (let i = 0; i < plan.items.length; i += size) batches.push(plan.items.slice(i, i + size));
+    for (let b = 0; b < batches.length; b += 1) {
+      let batch = batches[b]!;
+      onProgress({ step: "check", batch: b + 1, batches: batches.length });
+      const expires = deadline();
+      // Removing a skipped token changes the shared pool's execution order. Re-simulate until
+      // the exact remaining batch settles, using the immutable amounts the user confirmed.
+      while (batch.length > 0) {
+        let outcomes: readonly Outcome[];
+        try {
+          const { result } = await client.simulateContract({ ...exit, functionName: "sellAll", args: [batch.map(i => i.token.address), batch.map(minimum), expires], account });
+          outcomes = result[0];
+        } catch (e) {
+          const reason = `Final sale simulation failed: ${errorText(e)}. Refresh quotes to review a new sale.`;
+          for (const i of batch) results.set(key(i.token.address), { kind: "unsold", reason });
+          throw new Error(reason);
+        }
+        const keep: PlanItem[] = [];
+        for (const i of batch) {
+          const o = outcomes.find(x => same(x.token, i.token.address));
+          if (o?.status === 6) {
+            const reason = `${i.token.symbol} no longer meets the ${fmtAmount(minimum(i))} IMD minimum you confirmed. Refresh quotes to review a new sale.`;
+            results.set(key(i.token.address), { kind: "unsold", reason });
+            throw new Error(reason);
+          }
+          if (o?.status === STATUS_SOLD && o.imdOut > 0n && o.imdOut < minimum(i)) {
+            const reason = `${i.token.symbol} now quotes ${fmtAmount(o.imdOut)} IMD, below the ${fmtAmount(minimum(i))} IMD minimum you confirmed. Refresh quotes to review a new sale.`;
+            results.set(key(i.token.address), { kind: "unsold", reason });
+            throw new Error(reason);
+          }
+          if (settles(o, minimum(i))) keep.push(i);
+          else results.set(key(i.token.address), { kind: "unsold", reason: `${o ? (STATUS_TEXT[o.status] ?? "The sale would fail on chain") : "No selling outcome returned"}. No sale transaction was requested for this token. Refresh quotes to try again.` });
+        }
+        if (keep.length === batch.length) break;
+        batch = keep;
+      }
+      if (batch.length === 0) continue;
+      await assertWalletContext(wallet, account);
+      onProgress({ step: "sign", batch: b + 1, batches: batches.length });
+      const hash = await wallet.writeContract({ ...exit, functionName: "sellAll", args: [batch.map(i => i.token.address), batch.map(minimum), expires], account, chain: wallet.chain });
+      onProgress({ step: "mine", hash, batch: b + 1, batches: batches.length });
+      let receipt;
+      try { receipt = await confirmedReceipt(client, hash, "Sale"); }
+      catch (e) {
+        for (const i of batch) results.set(key(i.token.address), { kind: "unsold", reason: "The sale transaction reverted; this batch moved no tokens.", txHash: hash });
+        throw e;
+      }
+      const logs = parseEventLogs({ abi: swarmExitAbi, logs: receipt.logs.filter(log => same(log.address, SWARM_EXIT_ADDRESS)) });
+      const relevant = logs.filter(log => {
+        const args = log.args;
+        return "user" in args && same(args.user as string, account) && "token" in args && batch.some(i => same(i.token.address, args.token as string));
       });
-      batch = batch.map((i) => {
-        const o = result[0].find((x) => same(x.token, i.token.address));
-        return o && o.status === STATUS_SOLD && o.imdOut > 0n ? { ...i, imdOut: o.imdOut } : i;
-      });
-    } catch {
-      /* keep the plan's figures; the contract still enforces the minimums */
+      for (const i of batch) results.set(key(i.token.address), { kind: "unsold", reason: "Skipped by the contract.", txHash: hash });
+      for (const log of relevant) {
+        if (log.eventName === "TokenSold") results.set(key(log.args.token), { kind: "sold", imdOut: log.args.imdOut, txHash: hash });
+        else if (log.eventName === "TokenSkipped") results.set(key(log.args.token), { kind: "unsold", reason: STATUS_TEXT[Number(log.args.status)] ?? "Skipped by the contract.", txHash: hash });
+        else if (log.eventName === "TokenRefunded") results.set(key(log.args.token), { kind: "unsold", reason: "The sale failed on chain. Your tokens were refunded in the same transaction.", txHash: hash });
+      }
+      // Held refunds have priority regardless of the order in which the token's events appeared.
+      for (const log of relevant) if (log.eventName === "RefundHeld") results.set(key(log.args.token), { kind: "unsold", reason: "The token blocked its refund. It stays claimable here; use Claim refund below.", txHash: hash, held: true, heldAmount: log.args.amount });
     }
-    onProgress({ step: "sign", batch: b + 1, batches: batches.length });
-    let hash: Hash;
-    try {
-      hash = await wallet.writeContract({
-        ...exit,
-        functionName: "sellAll",
-        args: [batch.map((i) => i.token.address), batch.map((i) => (i.imdOut * (BPS - SLIPPAGE_BPS)) / BPS), deadline()],
-        account,
-        chain: wallet.chain,
-      });
-    } catch (e) {
-      for (const i of batch) results.set(key(i.token.address), { kind: "unsold", reason: `Not sent: ${e instanceof Error ? e.message.split("\n")[0] : e}` });
-      throw e;
-    }
-    onProgress({ step: "mine", hash, batch: b + 1, batches: batches.length });
-    const receipt = await client.waitForTransactionReceipt({ hash });
-    if (receipt.status !== "success") {
-      for (const i of batch) results.set(key(i.token.address), { kind: "unsold", reason: "The transaction reverted; nothing moved.", txHash: hash });
-      continue;
-    }
-    const logs = parseEventLogs({ abi: swarmExitAbi, logs: receipt.logs });
-    for (const i of batch) results.set(key(i.token.address), { kind: "unsold", reason: "Skipped by the contract.", txHash: hash });
-    for (const log of logs) {
-      if (log.eventName === "TokenSold") results.set(key(log.args.token), { kind: "sold", imdOut: log.args.imdOut, txHash: hash });
-      else if (log.eventName === "TokenSkipped")
-        results.set(key(log.args.token), { kind: "unsold", reason: STATUS_TEXT[Number(log.args.status)] ?? "Skipped by the contract.", txHash: hash });
-      else if (log.eventName === "TokenRefunded")
-        results.set(key(log.args.token), { kind: "unsold", reason: "The sale failed on chain. Your tokens were refunded in the same transaction.", txHash: hash });
-      else if (log.eventName === "RefundHeld")
-        results.set(key(log.args.token), { kind: "unsold", reason: "The sale failed and the token refused the refund. Claim it below.", txHash: hash, held: true });
-    }
+    return results;
+  } catch (e) {
+    throw new SaleExecutionError(e, results);
   }
-  return results;
 }
 
 export async function claimRefund(wallet: WalletClient, client: PublicClient, account: Address, token: Address): Promise<Hash> {
+  await assertWalletContext(wallet, account);
   const hash = await wallet.writeContract({ ...exit, functionName: "claimRefund", args: [token], account, chain: wallet.chain });
-  await client.waitForTransactionReceipt({ hash });
+  await confirmedReceipt(client, hash, "Refund claim");
   return hash;
 }

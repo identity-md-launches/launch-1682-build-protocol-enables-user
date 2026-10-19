@@ -3,7 +3,7 @@
 One-click sale of every swarm-launched token in a wallet for $IMD on Ethereum mainnet: the `SwarmExit` contract (live at `0x5c3c2a6d7d340db9f8b3e0cbbc8dbbb7ec73bc61`) and the SwarmSweep website that drives it.
 
 - `src/SwarmExit.sol`: the only launched contract (Solidity name `SwarmExit`, one constructor argument: the owner).
-- `web/`: the SwarmSweep website source (Vite, React, TypeScript, wagmi, viem). `dist/`: its committed static export, the thing that gets published. See [Website](#website-swarmsweep) below, `DESIGN.md` for the design system and `artifacts/validation.md` for the validation record.
+- `web/`: the SwarmSweep website source (Vite, React, TypeScript, wagmi, viem). `dist/`: its committed static export, the thing that gets published. See [Website](#website-swarmsweep) below, `DESIGN.md` for the design system and [REVIEW.md](REVIEW.md) for the current validation record.
 - `test/`: Foundry tests with mock Uniswap V2 / V3 venues, a mock Uniswap v4 PoolManager (flash accounting, native ETH), WETH, honeypot, fee-on-transfer, refund-blocking, no-liquidity and reentrant tokens.
 - `script/Deploy.s.sol`: reviewable deployment function used by the tests. The IMD launch deploys from bytecode through its factory; nobody runs this script against mainnet for the launch.
 
@@ -11,9 +11,9 @@ One-click sale of every swarm-launched token in a wallet for $IMD on Ethereum ma
 
 1. The owner registers each token the swarm launched (`setSwarmToken`, the address must have code) and the route that sells it (`setTokenRoute`). Three venues: a Uniswap V2 style path (`venue = 1`, `abi.encode(address[])`), a Uniswap V3 packed path (`venue = 2`, `token | fee | token …`), or a Uniswap v4 hop list (`venue = 3`, `abi.encode(address currencyIn, V4Hop[] hops)` where each hop is `(currencyOut, fee, tickSpacing, hooks)` and `address(0)` is native ETH). A route ends either directly in IMD or in the bridge currency (WETH or native ETH).
 2. The owner sets one global route from the bridge currency into IMD (`setImdRoute`). IMD's liquidity sits in the Uniswap v4 PoolManager, so the expected value is a v4 route from native ETH (or WETH) into IMD. WETH and ETH bridge 1:1 between legs: a V2/V3 leg ending in WETH is unwrapped before a v4 ETH leg, and a v4 leg ending in ETH is wrapped before a V2/V3 WETH leg.
-3. The website calls `previewAll(user)` with `eth_call`. For every registered token it returns the balance, the expected IMD and a status. A token is sellable only when it is registered, has a route, has a balance, quotes successfully through every leg (so a pool exists and the swap is possible), the bridge route is configured, the quote clears the dust threshold `minImdOut`, and the holding's price impact (full quote against a 1/1000 probe scaled up) is within `maxImpactBps`. v4 routes are quoted the way Uniswap's own quoter works: the swaps run inside `unlock` and revert with the result, so nothing settles.
+3. The website discovers factory launches, unions them with registered tokens, reads wallet balances, and calls chunked `preview(user, tokens)` with `eth_call`. For every registered token the preview returns the balance, the expected IMD and a status. A token is sellable only when it is registered, has a route, has a balance, quotes successfully through every leg (so a pool exists and the swap is possible), the bridge route is configured, the quote clears the dust threshold `minImdOut`, and the holding's price impact (full quote against a 1/1000 probe scaled up) is within `maxImpactBps`. v4 routes are quoted the way Uniswap's own quoter works: the swaps run inside `unlock` and revert with the result, so nothing settles.
 4. USD values: `quoteImdInBridge(1e18)` (IMD priced in ETH/WETH along the reversed IMD route) multiplied by the Chainlink ETH/USD price from `ethUsdPrice()` (staleness bound `MAX_PRICE_AGE`, 3 hours). These are display figures; no on-chain decision depends on them.
-5. The user approves each sellable token for its balance, the website dry-runs `sellAll` with `eth_call` and zero minimums, excludes any token whose simulated outcome is not `Sold` with proceeds at or above `minImdOut` (bisecting token by token if the whole call reverts), takes the simulated per-token outputs as the real quote (sales run one after another and share the IMD pool, so isolated quotes overstate later tokens), then sends `sellAll(tokens, minImdOuts, deadline)` with minimums `slippageBps` under those outputs, in batches of at most `MAX_TOKENS_PER_SALE`.
+5. The website checks allowances before planning. Already approved tokens are dry-run together with `sellAll`; tokens needing an approval retain the full-balance preview quote and are labelled **Approval required / Estimated proceeds**. The confirmation shows the amounts, gross IMD, 2% treasury fee and estimated net. After confirmation, missing approvals request exactly the displayed token balances and must mine successfully. Each sale batch is then simulated with the **same per-token minimums the visitor confirmed**: 97% of each displayed gross amount. A lower quote or a failed simulation stops for refresh and a new confirmation. Other skipped outcomes are removed and the remaining exact batch is simulated again before requesting its sale signature. There are at most 50 tokens per transaction; larger selections use multiple batches.
 6. `sellAll`, per token: (a) skip without touching the wallet when there is no route, no balance, no allowance, the quote fails, the bridge route is missing, or the quote is below the larger of the caller's minimum and `minImdOut` (status recorded in the outcome, `TokenSkipped` event); (b) pull `min(balance, allowance)` with a non-reverting call (a token that refuses the pull is a `SaleFailed` outcome, not a revert); (c) sell through its route in an atomic self-call (`executeSale`) that reverts when a leg yields nothing or the IMD is below the floor; (d) on failure refund what was pulled with a non-reverting transfer and, if the token refuses even that, hold it in `heldRefunds` for `claimRefund`. Then pool the IMD. If nothing sold, the whole call reverts with `NothingSold` so nothing moves.
 7. Of the pooled IMD, 2% (`SELL_TAX_BPS = 200`, rounded down) goes to the treasury `0xFC3ad9C531e1736690b2d5f24FebD35ebf051cFB`; the rest goes to the user.
 
@@ -38,7 +38,7 @@ The contract never keeps user tokens, ETH or IMD between transactions except hel
 | `IMPACT_PROBE_DIVISOR` | 1000 | The impact probe quotes 1/1000 of the holding |
 | `MAX_PRICE_AGE` | 3 hours | Oldest Chainlink answer accepted (feed heartbeat is 1 hour) |
 | `MAX_TOKENS_PER_SALE` | 50 | Tokens per `sellAll` call (the site batches above it) |
-| `web/src/config.ts` `SLIPPAGE_BPS` | 300 (3%) | Per-token minimum IMD = simulated output minus slippage |
+| `web/src/config.ts` `SLIPPAGE_BPS` | 300 (3%) | Per-token minimum IMD = the confirmed output minus slippage |
 | `web/src/config.ts` `DEADLINE_SECONDS` | 600 | Transaction deadline |
 
 ## After launch (owner responsibilities)
@@ -74,9 +74,9 @@ Checks 2 to 4 of the review ran on a mainnet fork of the live contract (`test/fo
 ## Trust assumptions and limits
 
 - Routes are fully trusted owner configuration. The owner decides which tokens count as swarm-launched and which pools sell them, and a route is arbitrary code that receives the user's full balance with no minimum of its own. The on-chain bounds are: a sale that yields nothing, or less than `max(minImdOuts[i], minImdOut)`, is refunded; above that, a wrong or malicious route can keep up to the caller's slippage tolerance (3% by default on the site) of every sale. Route changes take effect immediately and `sellAll` does not bind the caller to the routes it simulated. The owner can pause selling.
-- `rescue` cannot touch registered swarm tokens or held refunds; swarm tokens, bridge currency and IMD never rest in the contract because every sale settles or refunds within one transaction. Unregistering a token clears its route (and the token could then be rescued), which is why the contract never holds swarm tokens between transactions.
-- Sellability in `preview` is decided from quotes, the dust floor and the price-impact bound. A honeypot or approve-blocking token that quotes fine is reported sellable; the website's dry run of `sellAll` excludes it, and on chain it is refunded (or its refund held). Integrators using `preview` directly should dry-run `sellAll` the same way.
-- Fee-on-transfer tokens sell through V2 or v4 routes (measured amounts); Uniswap V3 cannot swap them. On v4 the callback pays the input first (sync, transfer, settle) and swaps only the amount the PoolManager credited, so a token that charges a fee on the transfer into the manager sells the post-fee amount instead of leaving an unsettled delta. `preview` quotes the pre-fee wallet balance, so `expectedImd` overstates their proceeds (on v4 by two fees: the pull and the transfer into the manager); the site takes the simulated output instead. A predictable failure (bad quote, below minimum) is skipped before the pull so no fee is paid; a sale that fails only at execution (liquidity moved after the simulation) costs one transfer fee on the pull and one on the refund.
+- `rescue` cannot touch registered swarm tokens or amounts owed as held refunds. A failed sale normally returns the tokens immediately. If the token blocks that transfer, it remains accounted to the seller in `heldRefunds` until a successful `claimRefund`. Unregistering a token clears its route; held refund amounts remain protected from rescue.
+- Sellability in `preview` is decided from quotes, the dust floor and the price-impact bound. A honeypot or approve-blocking token that quotes fine is reported sellable; the website's dry run of `sellAll` after approval excludes it, and an execution-time failure is refunded (or its refund held). Integrators using `preview` directly should dry-run `sellAll` the same way.
+- Fee-on-transfer tokens sell through V2 or v4 routes (measured amounts); Uniswap V3 cannot swap them. On v4 the callback pays the input first (sync, transfer, settle) and swaps only the amount the PoolManager credited, so a token that charges a fee on the transfer into the manager sells the post-fee amount instead of leaving an unsettled delta. `preview` quotes the pre-fee wallet balance, so `expectedImd` overstates their proceeds (on v4 by two fees: the pull and the transfer into the manager); the site can use an approved simulation to quote the actual output. If an initial unapproved estimate overstates proceeds beyond the confirmed 3% tolerance, execution stops; refresh and open a new confirmation rather than lowering that minimum silently. A predictable failure (bad quote, below minimum) is skipped before the pull so no fee is paid; a sale that fails only at execution (liquidity moved after the simulation) costs one transfer fee on the pull and one on the refund.
 - Quotes are DEX spot quotes used only for sellability and display. The on-chain protection against sandwiching is the per-token `minImdOuts` the user passes. Users should prefer a private RPC such as Flashbots Protect.
 - The sell tax rounds down (at most 1 wei per call less than 2%).
 - v4 pools with hooks are swapped with empty hook data; a hook that requires data or blocks the swap makes the sale fail and refund.
@@ -93,19 +93,21 @@ forge fmt --check
 
 The suite covers: owner and two-step ownership, registry add/remove (code check, route cleared on unregister), route validation (three venues), every preview status including price impact and a reverting `balanceOf`, the happy path with exact 2% / 98% split and zero residue, events, fee-on-transfer (V2 sale, v4 sale with the measured amount, pre-pull skip, execution-time refund), zero-balance and no-allowance skips, allowance-capped pull, honeypot refund with other tokens still sold, a pull the token refuses, a refund the token refuses (held, claimable, not rescuable), a route that pays nothing, the on-chain floor, no-liquidity and missing-bridge skips, nothing-sold revert, input validation, pause, self-call and callback guards, reentrancy from a malicious token, Chainlink checks, reversed V2 / V3 / v4 / multi-hop quoting, v4 direct and bridged sales in both wrap directions, v4 partial fills, rescue limits (tokens and ETH), the deploy function, runtime size and forbidden opcodes, and three fuzz tests (tax conservation on V2/V3 and v4, slippage guard).
 
-Tooling run: forge build, forge test (with the verifier's fuzz seed), forge fmt. Slither and Mythril were not available on this machine; the only `transferFrom` is made from `sellAll`'s loop with `msg.sender` as the source.
+Current build, test, formatting and Slither results, including the existing non-green checks and their review, are recorded in [REVIEW.md](REVIEW.md). The only `transferFrom` is made from `sellAll`'s loop with `msg.sender` as the source.
 
 ## Website (SwarmSweep)
 
-A single page at `dist/index.html`. The visitor connects a wallet (browser extensions by EIP-6963, phones through the wallet's own browser, Coinbase Smart Wallet), the page reads every swarm-registered token the wallet holds through `previewAll`, identifies each token's sell route (`tokenRoute`: Uniswap V2, V3 or v4, direct to IMD or through ETH) and shows the balance, the expected IMD and its USD value (`quoteImdInBridge` times Chainlink `ethUsdPrice`). Tokens the contract cannot sell are greyed out with "No sell route found" and the reason. "Sell all" or tick rows and "Sell selected" dry-runs `sellAll` with `eth_call`, drops any token whose sale would fail, and opens a confirmation listing the tokens, the gross IMD, the 2% fee to the treasury and the net the user receives. On confirm the wallet asks for one approval per token (exact balance) and then the `sellAll` transaction, with per-token minimums 3% under the simulated outputs; the user pays the gas. From the receipt each token is marked "Sold" (green) or "Unsold" (red); a token whose sale failed on chain is refunded by the contract in the same transaction, and a refund the token refused can be claimed with the "Claim refund" button.
+A single page at `dist/index.html`. The visitor connects through an EIP-6963 browser wallet, a phone wallet’s browser, or Coinbase Smart Wallet. SwarmSweep discovers factory launches independently of SwarmExit registration, reads the held balances, routes, IMD quotes and USD values, and explains unavailable tokens. Sell all and Sell selected open the approval-aware confirmation described above. Ethereum is required for all writes; changing the wallet’s chain or account blocks signing until the correct context is restored.
 
+Receipt events mark each token Sold or Unsold. A held refund takes precedence over a generic refund event and shows its amount and Claim refund action. Claims and owner setup steps are successful only after a successful receipt; failures retain the pending state and provide a transaction link. Wallet-read failures show retry guidance, and previous results remain visibly stale and cannot be sold. The owner panel separates registration from route completion, so interrupted setup can resume with just the missing route call.
 ### Install, preview, rebuild
 
 ```
 cd web
-npm ci                      # Node 24 was used; installs React, wagmi, viem, Vite, TypeScript from the lockfile
+npm ci                      # Node 22.23.3 used for this revision; uses the existing lockfile
 npm run dev                 # local dev server
-npm run build               # typecheck (tsc --noEmit) then vite build into ../dist
+npm run typecheck           # tsc --noEmit
+npm run build               # typecheck, then vite build into ../dist
 npm run preview             # serves the built dist/
 node --experimental-strip-types scripts/read-wallet.mjs [address]   # reads a wallet through the site's code against mainnet
 ```
@@ -118,12 +120,28 @@ The share image `web/public/og.png` is rendered from `web/scripts/og.html` with 
 
 ### Validation
 
-Run on 2026-10-15 against the final source (details, findings and limitations in `artifacts/validation.md`):
+The 2026-10-19 revision reproduces and fixes all nine reopened findings; `.imd-responses.json` answers each exact finding id for the revision worker. See [REVIEW.md](REVIEW.md) for evidence, all six Better Interface domains, commands, contract review and limitations.
 
-- `npx tsc --noEmit`: no errors. `npx vite build`: success (one chunk-size warning for the 636 kB wallet bundle).
-- ABI hash check `node --experimental-strip-types web/scripts/check-abi.mjs`: matches the deployment record.
-- `forge build`, `forge test` (128 unit, edge, invariant and fuzz tests): all pass. `MAINNET_RPC_URL=https://ethereum-rpc.publicnode.com forge test --match-contract SwarmExitMainnet`: 3 fork tests pass against the live contract and real pools (figures above).
-- Live wallet read of the test case through `web/scripts/read-wallet.mjs`: 187 launches, 142 held, 1 with a buyer (above). Discovery took 71 s and the wallet read 41 s on the free public RPC, which rate-limits batches; the page shows "Reading your wallet…" meanwhile. A faster RPC in `web/src/chain.ts` removes the wait.
-- Design probe `taste.mjs` on `dist/`: 16 of 16 checks passed at 320, 390 and 1440 wide (an earlier run failed copy-budget at 63 words; the summary label was shortened).
-- Interaction script `node --experimental-strip-types web/scripts/interact.mjs` (Playwright, Chromium; serves `dist/`, mocks the RPC, the launch factory, the v4 Quoter and an EIP-6963 wallet): all checks passed, covering the first screen at 390, keyboard and focus handling of the connect sheet, phone "Open in" links, connect, launch discovery, pool quotes for an unregistered token, route identification, greyed rows, USD values, selection, confirmation totals, approvals and `sellAll` arguments, Sold/Unsold marks, reflow at 320, and the owner panel (hidden for a holder, shown to the owner, sends `setSwarmToken` then `setTokenRoute`). Screenshots in `artifacts/screenshots/`.
-- Not performed: a real on-chain sale (needs the owner to register tokens first; the fork rehearsal stands in), WebKit/Safari, screen readers, 200% zoom.
+- Production build and explicit TypeScript typecheck pass. The wallet bundle retains Vite’s >500 kB warning.
+- 18 client regression tests pass: first-time/mixed approvals, immutable minimums, failed and mixed final simulations, held refunds, reverted receipts, setup retry, account/chain changes and multiple batches.
+- Chromium interaction checks cover selection, confirmation, approvals, settlement marks, held claims, setup interruption/retry, read errors, stale results, and wrong-network switching. The export is served under `/preview/` to check relative assets.
+- The design probe passes all 16 checks at 320, 390 and 1440 wide. Manual canvas-based checks cover the modern-color holdings text the probe does not resolve; unavailable names, balances, address links and mobile captions meet 4.5:1.
+- The supplied wallet read finds 265 launches and 135 held tokens (head at read start: Ethereum block 26228906). The live contract still has zero registrations, no IMD route and no feed. The owner must complete setup before any token can sell here. These are live reads, not a permanent count or a pinned-block snapshot.
+- The ABI hash matches the handoff and the compiled 24,519-byte runtime exactly matches the live contract. All 128 non-fork Foundry tests pass at a second fuzz seed with 1,024 fuzz runs. Existing Slither reports and three existing formatting differences in the historical fork test remain documented; this is not a clean static-analysis claim.
+- No real transaction was broadcast. WebKit is unavailable in the supplied browser installation. Native screen-reader, physical-wallet/mobile and browser-native 200% zoom checks were not performed. The 2026-10-15 fork results above are historical and were not rerun in this revision.
+
+From `web/`, rerun the client tests with:
+
+```sh
+node --experimental-strip-types --test scripts/revision-checks.mjs
+```
+
+With an installed Playwright module supplied through `IMD_PLAYWRIGHT` (and its browser path through `PLAYWRIGHT_BROWSERS_PATH`), run from the repository root:
+
+```sh
+node --experimental-strip-types web/scripts/interact.mjs
+node --experimental-strip-types web/scripts/interact.mjs --revision-only
+node .imd/reads/skills/design-critic/scripts/taste.mjs --out test/scratch/taste --offline
+```
+
+The taste script is a pinned job input and is available during this assignment. The committed interaction scripts remain runnable with Playwright after handoff. Generated test logs and screenshots go under `test/scratch/` and are not part of the export.

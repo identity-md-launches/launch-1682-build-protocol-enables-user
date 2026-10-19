@@ -1,6 +1,6 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { useAccount, useChainId, useConnect, useDisconnect, useSwitchChain, type Connector } from "wagmi";
+import { useAccount, useConnect, useDisconnect, useSwitchChain, type Connector } from "wagmi";
 import { chain, WALLET_ADD_CHAIN } from "../chain";
 import { WALLET_ICONS } from "./wallet-icons";
 import { OPEN_IN, isMobileBrowser } from "./open-in";
@@ -12,11 +12,10 @@ const svgUrl = (svg: string) => `data:image/svg+xml;utf8,${encodeURIComponent(sv
 /** The connect control and its sheet: the site's own type and colors, the network's structure. */
 export function ConnectSheet({ open: forced, mobile: forcedMobile }: { open?: boolean; mobile?: boolean }) {
   const mobile = forcedMobile ?? isMobileBrowser();
-  const { address, isConnected, connector: active } = useAccount();
-  const chainId = useChainId();
+  const { address, isConnected, connector: active, chainId } = useAccount();
   const { connectors, connect, isPending, variables, error, reset } = useConnect();
   const { disconnect } = useDisconnect();
-  const { switchChain, isPending: switching } = useSwitchChain();
+  const { switchChainAsync, isPending: switching } = useSwitchChain();
   const [open, setOpen] = useState(forced ?? false);
   const titleId = useId();
   const trigger = useRef<HTMLButtonElement>(null);
@@ -52,9 +51,11 @@ export function ConnectSheet({ open: forced, mobile: forcedMobile }: { open?: bo
 
   const onSwitch = async () => {
     try {
-      switchChain({ chainId: chain.id });
-    } catch {
-      /* fall through to addEthereumChain below */
+      await switchChainAsync({ chainId: chain.id });
+      return;
+    } catch (e) {
+      const code = (e as { code?: number; cause?: { code?: number } }).cause?.code ?? (e as { code?: number }).code;
+      if (code !== 4902) return;
     }
     const provider = (await active?.getProvider?.()) as { request?: (a: { method: string; params: unknown[] }) => Promise<unknown> } | undefined;
     if (provider?.request) {

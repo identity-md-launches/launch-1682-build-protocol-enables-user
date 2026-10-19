@@ -393,11 +393,11 @@ main {
 }
 
 .tokens tr.dim td:not(.status) {
-  color: var(--color-text-disabled);
+  color: var(--color-text-secondary);
 }
 
 .tokens tr.dim .addr {
-  color: var(--color-text-disabled);
+  color: var(--color-text-secondary);
 }
 
 .token-name {
@@ -733,9 +733,6 @@ main {
     display: block;
     font-size: var(--text-xs);
     color: var(--color-text-secondary);
-  }
-  .tokens tr.dim td::before {
-    color: var(--color-text-disabled);
   }
   .pill {
     white-space: normal;

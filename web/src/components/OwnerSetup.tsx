@@ -1,9 +1,11 @@
 import { useState } from "react";
-import type { Address, PublicClient, WalletClient } from "viem";
+import type { Address, Hash, PublicClient, WalletClient } from "viem";
 import { errorText } from "../lib/format";
 import type { Launch } from "../lib/launches";
 import { routable, setupSteps, type OwnerStep } from "../lib/owner";
 import type { WalletState } from "../lib/sweep";
+import { transactionHash } from "../lib/transactions";
+import { EXPLORER_URL } from "../config";
 
 type Props = {
   state: WalletState;
@@ -20,23 +22,33 @@ const same = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
 export function OwnerSetup({ state, wallet, client, account, busy, onDone }: Props) {
   const [running, setRunning] = useState<{ done: number; total: number; label: string } | null>(null);
   const [note, setNote] = useState("");
+  const [failedHash, setFailedHash] = useState<Hash | null>(null);
   const { setup, launches, tokens } = state;
   const registered = new Set(setup.registered.map((a) => a.toLowerCase()));
-  const unregisteredAll = launches.filter((l) => routable(l) && !registered.has(l.token.toLowerCase()));
-  const unregisteredHeld = unregisteredAll.filter((l) => tokens.some((t) => same(t.address, l.token) && t.balance > 0n));
+  const routableAll = launches.filter(routable);
+  const pendingAll = routableAll.filter(l => !registered.has(l.token.toLowerCase()) || !setup.routes[l.token.toLowerCase()]);
+  const pendingHeld = pendingAll.filter(l => tokens.some(t => same(t.address, l.token) && t.balance > 0n));
   const routesMissing = (!setup.imdRouteSet ? 1 : 0) + (!setup.feedSet ? 1 : 0);
+  const options = (pending: Launch[]) => ({
+    imdPool: setup.imdPool, imdRouteSet: setup.imdRouteSet, feedSet: setup.feedSet,
+    register: pending.filter(l => !registered.has(l.token.toLowerCase())),
+    routes: pending.filter(l => !registered.has(l.token.toLowerCase()) || !setup.routes[l.token.toLowerCase()]),
+  });
+  const count = (pending: Launch[]) => (!setup.imdRouteSet && setup.imdPool ? 1 : 0) + (!setup.feedSet ? 1 : 0) + options(pending).register.length + options(pending).routes.length;
 
-  const run = async (register: Launch[]) => {
-    if (!wallet || !client) return;
-    const steps: OwnerStep[] = setupSteps(wallet, client, account, { imdPool: setup.imdPool, imdRouteSet: setup.imdRouteSet, feedSet: setup.feedSet, register });
+  const run = async (pending: Launch[]) => {
+    if (!wallet || !client || busy) return;
+    const steps: OwnerStep[] = setupSteps(wallet, client, account, options(pending));
     if (steps.length === 0) return;
     setNote("");
+    setFailedHash(null);
     for (let i = 0; i < steps.length; i += 1) {
       const step = steps[i]!;
       setRunning({ done: i, total: steps.length, label: step.label });
       try {
         await step.run();
       } catch (e) {
+        setFailedHash(transactionHash(e));
         setNote(`Stopped at "${step.label}": ${errorText(e)}. What was sent before it stays set.`);
         setRunning(null);
         onDone();
@@ -48,7 +60,7 @@ export function OwnerSetup({ state, wallet, client, account, busy, onDone }: Pro
     onDone();
   };
 
-  const nothing = routesMissing === 0 && unregisteredAll.length === 0;
+  const nothing = routesMissing === 0 && pendingAll.length === 0;
   const disabled = busy || running !== null || !wallet;
 
   return (
@@ -74,22 +86,22 @@ export function OwnerSetup({ state, wallet, client, account, busy, onDone }: Pro
           <span className={`pill ${setup.feedSet ? "pill-ok" : "pill-bad"}`}>{setup.feedSet ? "Set" : "Missing"}</span> Chainlink ETH/USD feed
         </li>
         <li>
-          <span className={`pill ${unregisteredAll.length === 0 ? "pill-ok" : "pill-bad"}`}>
-            {launches.filter(routable).length - unregisteredAll.length} of {launches.filter(routable).length}
+          <span className={`pill ${pendingAll.length === 0 ? "pill-ok" : "pill-bad"}`}>
+            {routableAll.length - pendingAll.length} of {routableAll.length}
           </span>{" "}
-          swarm tokens registered with their launch pool as the route
+          swarm tokens configured. {routableAll.filter(l => registered.has(l.token.toLowerCase())).length} registered; {routableAll.filter(l => registered.has(l.token.toLowerCase()) && setup.routes[l.token.toLowerCase()]).length} with sale routes.
         </li>
       </ul>
       {!nothing && (
         <div className="actions">
-          {(routesMissing > 0 || unregisteredHeld.length > 0) && (
-            <button className="btn btn-primary" onClick={() => void run(unregisteredHeld)} disabled={disabled}>
-              {running ? "Sending…" : `Set up for this wallet (${routesMissing + unregisteredHeld.length * 2} transactions)`}
+          {(routesMissing > 0 || pendingHeld.length > 0) && (
+            <button className="btn btn-primary" onClick={() => void run(pendingHeld)} disabled={disabled || count(pendingHeld) === 0}>
+              {running ? "Sending…" : `Set up for this wallet (${count(pendingHeld)} transaction${count(pendingHeld) === 1 ? "" : "s"})`}
             </button>
           )}
-          {unregisteredAll.length > 0 && (
-            <button className="btn btn-secondary" onClick={() => void run(unregisteredAll)} disabled={disabled}>
-              Register all {unregisteredAll.length} launched tokens ({routesMissing + unregisteredAll.length * 2} transactions)
+          {pendingAll.length > 0 && (
+            <button className="btn btn-secondary" onClick={() => void run(pendingAll)} disabled={disabled}>
+              Complete setup for {pendingAll.length} launched token{pendingAll.length === 1 ? "" : "s"} ({count(pendingAll)} transaction{count(pendingAll) === 1 ? "" : "s"})
             </button>
           )}
           {!wallet && <span className="hint">The wallet client is not ready.</span>}
@@ -97,6 +109,7 @@ export function OwnerSetup({ state, wallet, client, account, busy, onDone }: Pro
       )}
       <p className="status-line" role="status" aria-live="polite">
         {running ? `${running.label} (${running.done + 1} of ${running.total}). Confirm it in your wallet…` : note || (nothing ? "Everything is configured." : "")}
+        {failedHash && <> <a href={`${EXPLORER_URL}/tx/${failedHash}`} target="_blank" rel="noreferrer">View failed transaction</a></>}
       </p>
     </section>
   );

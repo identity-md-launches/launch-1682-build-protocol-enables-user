@@ -2,6 +2,8 @@ import { EXPLORER_URL, IMD_SYMBOL } from "../config";
 import { fmtAmount, fmtUsd, short } from "../lib/format";
 import { STATUS_TEXT, usdValue, type Pricing, type SwarmToken } from "../lib/sweep";
 
+export type WalletLoadStatus = "idle" | "loading" | "success" | "error";
+
 type Props = {
   tokens: SwarmToken[];
   pricing: Pricing | null;
@@ -11,7 +13,8 @@ type Props = {
   claiming: string | null;
   busy: boolean;
   connected: boolean;
-  loading: boolean;
+  onChain: boolean;
+  loadStatus: WalletLoadStatus;
 };
 
 function StatusCell({ t }: { t: SwarmToken }) {
@@ -30,6 +33,7 @@ function StatusCell({ t }: { t: SwarmToken }) {
       <>
         <span className="pill pill-bad">Unsold</span>
         <span className="note">{t.result.reason}</span>
+        {t.result.txHash && <a href={`${EXPLORER_URL}/tx/${t.result.txHash}`} target="_blank" rel="noreferrer">View transaction</a>}
       </>
     );
   }
@@ -48,7 +52,7 @@ function StatusCell({ t }: { t: SwarmToken }) {
   );
 }
 
-export function TokenList({ tokens, pricing, selected, onToggle, onClaim, claiming, busy, connected, loading }: Props) {
+export function TokenList({ tokens, pricing, selected, onToggle, onClaim, claiming, busy, connected, onChain, loadStatus }: Props) {
   return (
     <div className="list" role="region" aria-labelledby="tokens-heading">
       <h2 id="tokens-heading" className="h3">
@@ -72,12 +76,14 @@ export function TokenList({ tokens, pricing, selected, onToggle, onClaim, claimi
               <td colSpan={5}>Connect a wallet to list the swarm-launched tokens it holds.</td>
             </tr>
           )}
-          {connected && loading && (
+          {connected && !onChain && <tr className="empty"><td colSpan={5}>Switch your wallet to Ethereum to read its tokens.</td></tr>}
+          {connected && onChain && (loadStatus === "loading" || loadStatus === "idle") && (
             <tr className="empty">
-              <td colSpan={5}>Reading your wallet…</td>
+              <td colSpan={5}>Reading your wallet…{tokens.length > 0 ? " Previous results below are stale until this read finishes." : ""}</td>
             </tr>
           )}
-          {connected && !loading && tokens.length === 0 && (
+          {connected && onChain && loadStatus === "error" && <tr className="empty"><td colSpan={5}>Wallet could not be read. Refresh to try again.{tokens.length > 0 ? " Previous results below are stale." : ""}</td></tr>}
+          {connected && onChain && loadStatus === "success" && tokens.length === 0 && (
             <tr className="empty">
               <td colSpan={5}>No swarm-launched tokens in this wallet. Nothing to sell.</td>
             </tr>

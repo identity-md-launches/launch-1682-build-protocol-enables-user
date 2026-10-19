@@ -5,6 +5,7 @@ import { encodeAbiParameters, type Address, type Hash, type PublicClient, type W
 import { swarmExitAbi } from "../abi/swarmExit.ts";
 import { CHAINLINK_ETH_USD_ADDRESS, IMD_ADDRESS, NATIVE, POOL_MANAGER_ADDRESS, SWARM_EXIT_ADDRESS } from "../constants.ts";
 import type { Launch, PoolKey } from "./launches.ts";
+import { assertWalletContext, confirmedReceipt } from "./transactions.ts";
 
 const exit = { address: SWARM_EXIT_ADDRESS, abi: swarmExitAbi } as const;
 const VENUE_V4 = 3;
@@ -38,11 +39,12 @@ export function setupSteps(
   wallet: WalletClient,
   client: PublicClient,
   account: Address,
-  opts: { imdPool: PoolKey | null; imdRouteSet: boolean; feedSet: boolean; register: Launch[] },
+  opts: { imdPool: PoolKey | null; imdRouteSet: boolean; feedSet: boolean; register: Launch[]; routes?: Launch[] },
 ): OwnerStep[] {
   const write = (functionName: "setImdRoute" | "setEthUsdFeed" | "setSwarmToken" | "setTokenRoute", args: readonly unknown[]) => async () => {
+    await assertWalletContext(wallet, account);
     const hash = await wallet.writeContract({ ...exit, functionName, args: args as never, account, chain: wallet.chain } as never);
-    await client.waitForTransactionReceipt({ hash });
+    await confirmedReceipt(client, hash, "Owner setup");
     return hash;
   };
   const steps: OwnerStep[] = [];
@@ -52,6 +54,8 @@ export function setupSteps(
   if (!opts.feedSet) steps.push({ label: "Set the ETH/USD price feed", run: write("setEthUsdFeed", [CHAINLINK_ETH_USD_ADDRESS]) });
   for (const l of opts.register) {
     steps.push({ label: `Register launch ${l.id}`, run: write("setSwarmToken", [l.token, true]) });
+  }
+  for (const l of opts.routes ?? opts.register) {
     steps.push({ label: `Set the route of launch ${l.id}`, run: write("setTokenRoute", [l.token, VENUE_V4, POOL_MANAGER_ADDRESS, NATIVE, v4RouteData(l.token, l.key)]) });
   }
   return steps;
